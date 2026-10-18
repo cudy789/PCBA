@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "png-to-gerber"
+version = "0.1.0"
+description = "Interactive tool that converts PNG artwork into KiCad-compatible Gerber layers (copper, solder mask, silkscreen, board outline)."
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "opencv-python>=4.10",
+    "Pillow>=10.0",
+    "shapely>=2.0",
+    "PySide6>=6.7",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-qt>=4.4",
+]
+build = [
+    "pyinstaller>=6.0",
+]
+
+[project.gui-scripts]
+png-to-gerber = "png_to_gerber.gui.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+qt_api = "pyside6"
