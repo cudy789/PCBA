@@ -31,6 +31,7 @@ def test_there_is_no_image_menu_and_file_owns_export(qtbot, fixture_image_path):
     assert [action.text().replace("&", "") for action in export.actions()] == [
         "Gerber files...",
         "Gerber ZIP...",
+        "Export image...",
     ]
 
     view_menu = win.menuBar().actions()[1].menu()

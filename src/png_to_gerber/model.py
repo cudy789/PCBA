@@ -1,9 +1,11 @@
 """Typed project/layer data model.
 
-Layers mask a single color of the source image, or (for "negative" layers) are
-derived from the inverse of other layers. Copper, solder-mask-opening, and
-silkscreen layers choose a PCB side (front/back); the cut layer defines a
-single contiguous board perimeter, so a project may hold at most one of them.
+A project holds any number of base images. Layers mask a single color of their
+own image, or (for "negative" layers) are derived from the inverse of other
+layers, which may belong to any image. Copper, solder-mask-opening, and
+silkscreen layers choose a PCB side (front/back). Each cut layer is one
+contiguous board perimeter; a project may hold any number of them, and export
+unions those perimeters into the board outline.
 """
 
 from __future__ import annotations
@@ -36,11 +38,16 @@ class OutlineMode(Enum):
 
 SIDED_TYPES = (LayerType.COPPER, LayerType.MASK, LayerType.SILKSCREEN)
 
-_id_counter = itertools.count(1)
+_layer_ids = itertools.count(1)
+_image_ids = itertools.count(1)
 
 
 def _next_layer_id() -> int:
-    return next(_id_counter)
+    return next(_layer_ids)
+
+
+def _next_image_id() -> int:
+    return next(_image_ids)
 
 
 @dataclass
@@ -89,38 +96,192 @@ class BoardSettings:
 
 
 @dataclass
-class Project:
-    """An ordered stack of layers over one source image."""
+class BaseImage:
+    """One source image and the layers masked from it."""
 
-    layers: list[Layer] = field(default_factory=list)
-    board: BoardSettings = field(default_factory=BoardSettings)
-    image_path: str | None = None
+    name: str = "Base image"
+    path: str | None = None
     background_removed: bool = False
     background_tolerance: int = DEFAULT_BG_TOLERANCE
-    base_visible: bool = True
-    checker_opacity: int = 50  # transparency checkerboard strength, 0-100
+    visible: bool = True
+    layers: list[Layer] = field(default_factory=list)
+    id: int = field(default_factory=_next_image_id)
 
-    def add_layer(self, layer: Layer, after_id: int | None = None) -> Layer:
-        if layer.layer_type == LayerType.CUT:
-            if layer.negative_of:
-                raise ProjectError("A cut layer cannot be a negative layer.")
-            if self.cut_layer() is not None:
-                raise ProjectError(
-                    "The project already has a cut layer; the board outline "
-                    "must be a single contiguous perimeter."
+
+class Project:
+    """Layers nested under one or more base images, plus board settings.
+
+    `image_path`, `background_removed`, `background_tolerance`, and
+    `base_visible` read and write the first image so a one-image project keeps
+    the original attribute interface. `layers` is every layer in image order.
+    """
+
+    def __init__(
+        self,
+        image_path: str | None = None,
+        *,
+        background_removed: bool = False,
+        background_tolerance: int = DEFAULT_BG_TOLERANCE,
+        base_visible: bool = True,
+        checker_opacity: int = 50,
+        board: BoardSettings | None = None,
+        images: list[BaseImage] | None = None,
+    ):
+        self.images: list[BaseImage] = list(images) if images else []
+        self.board = board if board is not None else BoardSettings()
+        self.checker_opacity = checker_opacity
+        if images:
+            return
+        if (
+            image_path is not None
+            or background_removed
+            or background_tolerance != DEFAULT_BG_TOLERANCE
+            or not base_visible
+        ):
+            self.images.append(
+                BaseImage(
+                    name=_image_name(image_path),
+                    path=image_path,
+                    background_removed=background_removed,
+                    background_tolerance=background_tolerance,
+                    visible=base_visible,
                 )
+            )
+
+    def add_image(
+        self,
+        name: str = "Base image",
+        path: str | None = None,
+        *,
+        background_removed: bool = False,
+        background_tolerance: int = DEFAULT_BG_TOLERANCE,
+        visible: bool = True,
+    ) -> BaseImage:
+        image = BaseImage(
+            name=name or _image_name(path),
+            path=path,
+            background_removed=background_removed,
+            background_tolerance=background_tolerance,
+            visible=visible,
+        )
+        self.images.append(image)
+        return image
+
+    def get_image(self, image_id: int) -> BaseImage | None:
+        for image in self.images:
+            if image.id == image_id:
+                return image
+        return None
+
+    def image_of(self, layer_id: int) -> BaseImage | None:
+        for image in self.images:
+            if any(layer.id == layer_id for layer in image.layers):
+                return image
+        return None
+
+    def remove_image(self, image_id: int) -> list[int]:
+        """Drop an image and its layers. Returns every removed layer id."""
+        image = self.get_image(image_id)
+        if image is None:
+            return []
+        removed: list[int] = []
+        for layer in list(image.layers):
+            if self.get_layer(layer.id) is not None:
+                removed.extend(self.remove_layer(layer.id))
+        self.images = [existing for existing in self.images if existing.id != image_id]
+        return removed
+
+    @property
+    def layers(self) -> list[Layer]:
+        return [layer for image in self.images for layer in image.layers]
+
+    def _primary(self) -> BaseImage | None:
+        return self.images[0] if self.images else None
+
+    def _ensure_primary(self) -> BaseImage:
+        if not self.images:
+            self.images.append(BaseImage())
+        return self.images[0]
+
+    @property
+    def image_path(self) -> str | None:
+        image = self._primary()
+        return image.path if image is not None else None
+
+    @image_path.setter
+    def image_path(self, value: str | None) -> None:
+        if not self.images:
+            if value is None:
+                return
+            self.add_image(name=_image_name(value), path=value)
+            return
+        self.images[0].path = value
+        if value and self.images[0].name == "Base image":
+            self.images[0].name = _image_name(value)
+
+    @property
+    def background_removed(self) -> bool:
+        image = self._primary()
+        return image.background_removed if image is not None else False
+
+    @background_removed.setter
+    def background_removed(self, value: bool) -> None:
+        self._ensure_primary().background_removed = bool(value)
+
+    @property
+    def background_tolerance(self) -> int:
+        image = self._primary()
+        return image.background_tolerance if image is not None else DEFAULT_BG_TOLERANCE
+
+    @background_tolerance.setter
+    def background_tolerance(self, value: int) -> None:
+        self._ensure_primary().background_tolerance = int(value)
+
+    @property
+    def base_visible(self) -> bool:
+        image = self._primary()
+        return image.visible if image is not None else True
+
+    @base_visible.setter
+    def base_visible(self, value: bool) -> None:
+        self._ensure_primary().visible = bool(value)
+
+    def add_layer(
+        self,
+        layer: Layer,
+        after_id: int | None = None,
+        image_id: int | None = None,
+    ) -> Layer:
+        if layer.is_cut and layer.negative_of:
+            raise ProjectError("A cut layer cannot be a negative layer.")
         for source_id in layer.negative_of:
             if self.get_layer(source_id) is None:
                 raise ProjectError(f"Negative source layer {source_id} does not exist.")
+        image = self._image_for_new_layer(image_id, after_id)
         if after_id is None:
-            self.layers.append(layer)
-        else:
-            idx = next((i for i, existing in enumerate(self.layers) if existing.id == after_id), None)
-            if idx is None:
-                self.layers.append(layer)
-            else:
-                self.layers.insert(idx + 1, layer)
+            image.layers.append(layer)
+            return layer
+        owner = self.image_of(after_id)
+        if owner is not image:
+            image.layers.append(layer)
+            return layer
+        idx = next(i for i, existing in enumerate(image.layers) if existing.id == after_id)
+        image.layers.insert(idx + 1, layer)
         return layer
+
+    def _image_for_new_layer(self, image_id: int | None, after_id: int | None) -> BaseImage:
+        if image_id is not None:
+            image = self.get_image(image_id)
+            if image is None:
+                raise ProjectError(f"Base image {image_id} does not exist.")
+            return image
+        if after_id is not None:
+            owner = self.image_of(after_id)
+            if owner is not None:
+                return owner
+        if not self.images:
+            return self.add_image()
+        return self.images[0]
 
     def remove_layer(self, layer_id: int) -> list[int]:
         """Remove a layer; returns every removed layer id.
@@ -134,7 +295,7 @@ class Project:
             current = pending.pop()
             if self.get_layer(current) is None:
                 continue
-            self.layers = [l for l in self.layers if l.id != current]
+            self._take_layer(current)
             removed.append(current)
             for layer in self.layers:
                 if current in layer.negative_of:
@@ -143,6 +304,13 @@ class Project:
                         pending.append(layer.id)
         return removed
 
+    def _take_layer(self, layer_id: int) -> None:
+        for image in self.images:
+            for index, layer in enumerate(image.layers):
+                if layer.id == layer_id:
+                    image.layers.pop(index)
+                    return
+
     def get_layer(self, layer_id: int) -> Layer | None:
         for layer in self.layers:
             if layer.id == layer_id:
@@ -150,20 +318,22 @@ class Project:
         return None
 
     def move_layer(self, layer_id: int, delta: int) -> None:
-        """Move a layer up (delta < 0) or down (delta > 0) in the stack."""
-        idx = next((i for i, l in enumerate(self.layers) if l.id == layer_id), None)
-        if idx is None:
+        """Move a layer up (delta < 0) or down (delta > 0) within its image."""
+        image = self.image_of(layer_id)
+        if image is None:
             return
-        new_idx = max(0, min(len(self.layers) - 1, idx + delta))
+        idx = next(i for i, layer in enumerate(image.layers) if layer.id == layer_id)
+        new_idx = max(0, min(len(image.layers) - 1, idx + delta))
         if new_idx != idx:
-            layer = self.layers.pop(idx)
-            self.layers.insert(new_idx, layer)
+            layer = image.layers.pop(idx)
+            image.layers.insert(new_idx, layer)
+
+    def cut_layers(self) -> list[Layer]:
+        return [layer for layer in self.layers if layer.is_cut]
 
     def cut_layer(self) -> Layer | None:
-        for layer in self.layers:
-            if layer.is_cut:
-                return layer
-        return None
+        cuts = self.cut_layers()
+        return cuts[0] if cuts else None
 
     def artwork_layers(self) -> list[Layer]:
         return [l for l in self.layers if not l.is_cut]
@@ -238,4 +408,13 @@ def default_layer_name(layer_type: LayerType, existing: list[Layer]) -> str:
         LayerType.CUT: "Board outline",
     }[layer_type]
     n = sum(1 for l in existing if l.layer_type == layer_type) + 1
-    return f"{base} {n}" if layer_type != LayerType.CUT else base
+    if layer_type == LayerType.CUT and n == 1:
+        return base
+    return f"{base} {n}"
+
+
+def _image_name(path: str | None) -> str:
+    if not path:
+        return "Base image"
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    return name or "Base image"

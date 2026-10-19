@@ -77,6 +77,7 @@ class ImageCanvas(QGraphicsView):
         self.setBackgroundBrush(_checker_brush(self.checker_opacity))  # shows transparency
 
         self.base_item: QGraphicsPixmapItem | None = None
+        self.base_items: dict[int, QGraphicsPixmapItem] = {}
         self.overlay_items: dict[int, QGraphicsPixmapItem] = {}
         self.outline_items: dict[int, QGraphicsPathItem] = {}
         self.eyedropper_active = False
@@ -85,18 +86,35 @@ class ImageCanvas(QGraphicsView):
     # ---- content management -------------------------------------------------
 
     def set_image(self, rgba: np.ndarray, fit: bool = True) -> None:
-        """Show a new base image. `fit=False` keeps the current zoom/pan."""
+        """Show one base image. `fit=False` keeps the current zoom/pan."""
+        self.set_bases([(0, rgba)], fit=fit)
+
+    def set_bases(self, images: list[tuple[int, np.ndarray]], fit: bool = True) -> None:
+        """Show every base image, each aligned to the top-left of the canvas.
+
+        Later images paint above earlier ones. The scene covers the largest
+        width and height. `fit=False` keeps the current zoom when the canvas
+        size does not change. `base_item` is the first image, for callers that
+        still track a single pixmap.
+        """
         self._scene.clear()
         self.overlay_items.clear()
         self.outline_items.clear()
-        pixmap = QPixmap.fromImage(rgba_to_qimage(rgba))
-        self.base_item = self._scene.addPixmap(pixmap)
-        self.base_item.setZValue(0)
-        h, w = rgba.shape[:2]
-        same_size = self._image_size == (w, h)
-        self._image_size = (w, h)
-        self._scene.setSceneRect(0, 0, w, h)
-        if fit or not same_size:
+        self.base_items = {}
+        self.base_item = None
+        max_w = max((int(rgba.shape[1]) for _, rgba in images), default=0)
+        max_h = max((int(rgba.shape[0]) for _, rgba in images), default=0)
+        for z, (image_id, rgba) in enumerate(images):
+            item = self._scene.addPixmap(QPixmap.fromImage(rgba_to_qimage(rgba)))
+            item.setPos(0, 0)
+            item.setZValue(z)
+            self.base_items[image_id] = item
+            if self.base_item is None:
+                self.base_item = item
+        same_size = self._image_size == (max_w, max_h) and max_w > 0
+        self._image_size = (max_w, max_h) if images else None
+        self._scene.setSceneRect(0, 0, max(max_w, 1), max(max_h, 1))
+        if images and (fit or not same_size):
             self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
 
     def set_checker_opacity(self, percent: int) -> None:
@@ -104,9 +122,14 @@ class ImageCanvas(QGraphicsView):
         self.checker_opacity = max(0, min(100, int(percent)))
         self.setBackgroundBrush(_checker_brush(self.checker_opacity))
 
-    def set_base_visible(self, visible: bool) -> None:
-        if self.base_item is not None:
-            self.base_item.setVisible(visible)
+    def set_base_visible(self, visible: bool, image_id: int | None = None) -> None:
+        """Hide or show one base image. With no id, the first image is used."""
+        if image_id is None:
+            item = self.base_item
+        else:
+            item = self.base_items.get(image_id)
+        if item is not None:
+            item.setVisible(visible)
 
     def set_layer_overlay(
         self, layer_id: int, mask: np.ndarray, layer_type_value: str
@@ -121,6 +144,12 @@ class ImageCanvas(QGraphicsView):
             self.overlay_items[layer_id] = item
         else:
             item.setPixmap(pixmap)
+
+    def clear_layer_overlay(self, layer_id: int) -> None:
+        """Remove a layer's filled tint, leaving any outline in place."""
+        item = self.overlay_items.pop(layer_id, None)
+        if item is not None:
+            self._scene.removeItem(item)
 
     def set_layer_outline(self, layer_id: int, coords: list[tuple[float, float]]):
         """Create or update the smooth cut-outline path for a cut layer."""

@@ -1,9 +1,13 @@
 """.prj project files: JSON snapshots of layers, board size, and view state.
 
-Layers reference each other (negative layers) by their index in the saved
-list, so reloading assigns fresh runtime ids without breaking the references.
-The source image is stored by absolute path plus a path relative to the
-project file, so a project folder can be moved or shared along with its image.
+A project with one base image is written as version 1: a single image path and
+a flat layer list. A project with several images is version 2: each image
+keeps its own layers, background removal, and visibility. Negative layers
+refer to other layers by index in that flat list (version 2 indexes across
+every image, in order), so reloading assigns fresh runtime ids without
+breaking the references. Each source image is stored by absolute path plus a
+path relative to the project file, so a project folder can be moved or shared
+along with its images.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from typing import Any
 
 from .model import (
     DEFAULT_BG_TOLERANCE,
+    BaseImage,
     BoardSettings,
     Layer,
     LayerType,
@@ -25,7 +30,7 @@ from .model import (
 )
 
 FORMAT = "png_to_gerber_project"
-VERSION = 1
+VERSION = 2
 EXTENSION = ".prj"
 
 
@@ -55,38 +60,68 @@ def _layer_to_dict(layer: Layer, index_of: dict[int, int]) -> dict[str, Any]:
     }
 
 
+def _path_dict(path: str | None, project_dir: Path | None) -> dict[str, Any]:
+    image: dict[str, Any] = {"absolute": None, "relative": None}
+    if not path:
+        return image
+    absolute = Path(path).absolute()
+    image["absolute"] = str(absolute)
+    if project_dir is not None:
+        try:
+            image["relative"] = os.path.relpath(absolute, project_dir)
+        except ValueError:  # different drive on Windows
+            image["relative"] = None
+    return image
+
+
+def _board_dict(board: BoardSettings) -> dict[str, Any]:
+    return {
+        "width_mm": board.width_mm,
+        "height_mm": board.height_mm,
+        "lock_aspect": board.lock_aspect,
+        "output_dir": board.output_dir,
+        "base_name": board.base_name,
+    }
+
+
 def project_to_dict(project: Project, project_dir: Path | None = None) -> dict[str, Any]:
     index_of = {layer.id: i for i, layer in enumerate(project.layers)}
-    image: dict[str, Any] = {"absolute": None, "relative": None}
-    if project.image_path:
-        absolute = Path(project.image_path).absolute()
-        image["absolute"] = str(absolute)
-        if project_dir is not None:
-            try:
-                image["relative"] = os.path.relpath(absolute, project_dir)
-            except ValueError:  # different drive on Windows
-                image["relative"] = None
-    board = project.board
+    board = _board_dict(project.board)
+    if len(project.images) <= 1:
+        image = project.images[0] if project.images else None
+        return {
+            "format": FORMAT,
+            "version": 1,
+            "image": _path_dict(image.path if image else None, project_dir),
+            "background": {
+                "removed": image.background_removed if image else False,
+                "tolerance": image.background_tolerance if image else DEFAULT_BG_TOLERANCE,
+            },
+            "board": board,
+            "view": {
+                "base_visible": image.visible if image else True,
+                "checker_opacity": project.checker_opacity,
+            },
+            "layers": [_layer_to_dict(layer, index_of) for layer in project.layers],
+        }
+
+    images = []
+    for image in project.images:
+        stored = _path_dict(image.path, project_dir)
+        stored["name"] = image.name
+        stored["background"] = {
+            "removed": image.background_removed,
+            "tolerance": image.background_tolerance,
+        }
+        stored["visible"] = image.visible
+        stored["layers"] = [_layer_to_dict(layer, index_of) for layer in image.layers]
+        images.append(stored)
     return {
         "format": FORMAT,
         "version": VERSION,
-        "image": image,
-        "background": {
-            "removed": project.background_removed,
-            "tolerance": project.background_tolerance,
-        },
-        "board": {
-            "width_mm": board.width_mm,
-            "height_mm": board.height_mm,
-            "lock_aspect": board.lock_aspect,
-            "output_dir": board.output_dir,
-            "base_name": board.base_name,
-        },
-        "view": {
-            "base_visible": project.base_visible,
-            "checker_opacity": project.checker_opacity,
-        },
-        "layers": [_layer_to_dict(layer, index_of) for layer in project.layers],
+        "images": images,
+        "board": board,
+        "view": {"checker_opacity": project.checker_opacity},
     }
 
 
@@ -188,36 +223,7 @@ def _parse_layer(data: Any, index: int, count: int) -> tuple[Layer, list[int]]:
     return layer, sources
 
 
-def project_from_dict(data: Any, project_dir: Path | None = None) -> Project:
-    if not isinstance(data, dict) or data.get("format") != FORMAT:
-        raise ProjectFileError("This is not a png_to_gerber project file.")
-    version = data.get("version")
-    if not isinstance(version, int) or version < 1 or version > VERSION:
-        raise ProjectFileError(
-            f"Unsupported project version {version!r} (this app reads up to {VERSION})."
-        )
-
-    raw_layers = data.get("layers", [])
-    if not isinstance(raw_layers, list):
-        raise ProjectFileError("'layers' must be a list.")
-    parsed = [_parse_layer(d, i, len(raw_layers)) for i, d in enumerate(raw_layers)]
-    layers = [layer for layer, _ in parsed]
-    for layer, sources in parsed:
-        layer.negative_of = [layers[s].id for s in sources]
-
-    project = Project()
-    try:
-        for layer in layers:
-            project.layers.append(layer)
-        if sum(1 for l in layers if l.is_cut) > 1:
-            raise ProjectError("The project has more than one cut layer.")
-        project.dependency_order([l.id for l in layers])  # rejects cycles
-    except ProjectError as e:
-        raise ProjectFileError(str(e)) from None
-
-    image = data.get("image") or {}
-    if not isinstance(image, dict):
-        raise ProjectFileError("'image' must be an object.")
+def _resolve_image_path(image: dict, project_dir: Path | None) -> str | None:
     candidates = []
     relative, absolute = image.get("relative"), image.get("absolute")
     if isinstance(relative, str) and relative and project_dir is not None:
@@ -226,23 +232,17 @@ def project_from_dict(data: Any, project_dir: Path | None = None) -> Project:
         candidates.append(Path(absolute))
     existing = next((c for c in candidates if c.is_file()), None)
     chosen = existing or (candidates[0] if candidates else None)
-    project.image_path = str(chosen) if chosen is not None else None
+    return str(chosen) if chosen is not None else None
 
-    background = data.get("background") or {}
-    if not isinstance(background, dict):
-        raise ProjectFileError("'background' must be an object.")
-    project.background_removed = _get_bool(background, "removed", False, "background")
-    project.background_tolerance = _get_int(
-        background, "tolerance", DEFAULT_BG_TOLERANCE, 0, 255, "background"
-    )
 
+def _parse_board(data: dict) -> BoardSettings:
     board = data.get("board") or {}
     if not isinstance(board, dict):
         raise ProjectFileError("'board' must be an object.")
     output_dir, base_name = board.get("output_dir", ""), board.get("base_name", "")
     if not isinstance(output_dir, str) or not isinstance(base_name, str):
         raise ProjectFileError("board: 'output_dir' and 'base_name' must be strings.")
-    project.board = BoardSettings(
+    return BoardSettings(
         width_mm=_get_optional_float(board, "width_mm", "board"),
         height_mm=_get_optional_float(board, "height_mm", "board"),
         lock_aspect=_get_bool(board, "lock_aspect", True, "board"),
@@ -250,12 +250,131 @@ def project_from_dict(data: Any, project_dir: Path | None = None) -> Project:
         base_name=base_name,
     )
 
+
+def _parse_checker(data: dict) -> int:
     view = data.get("view") or {}
     if not isinstance(view, dict):
         raise ProjectFileError("'view' must be an object.")
-    project.base_visible = _get_bool(view, "base_visible", True, "view")
-    project.checker_opacity = _get_int(view, "checker_opacity", 50, 0, 100, "view")
+    return _get_int(view, "checker_opacity", 50, 0, 100, "view")
+
+
+def _attach_layers(project: Project, images: list[tuple[BaseImage, list[tuple[Layer, list[int]]]]]) -> None:
+    """Give each image its layers and remap negative indexes to fresh ids."""
+    flat: list[Layer] = []
+    pending: list[tuple[Layer, list[int]]] = []
+    for image, parsed in images:
+        for layer, sources in parsed:
+            image.layers.append(layer)
+            flat.append(layer)
+            pending.append((layer, sources))
+    for layer, sources in pending:
+        layer.negative_of = [flat[s].id for s in sources]
+    try:
+        project.dependency_order([layer.id for layer in flat])
+    except ProjectError as e:
+        raise ProjectFileError(str(e)) from None
+
+
+def project_from_dict(data: Any, project_dir: Path | None = None) -> Project:
+    if not isinstance(data, dict) or data.get("format") != FORMAT:
+        raise ProjectFileError("This is not a png_to_gerber project file.")
+    version = data.get("version")
+    if not isinstance(version, int) or version < 1 or version > VERSION:
+        raise ProjectFileError(
+            f"Unsupported project version {version!r} (this app reads up to {VERSION})."
+        )
+    if version >= 2:
+        if not isinstance(data.get("images"), list):
+            raise ProjectFileError(
+                f"Unsupported project version {version!r} (this app reads up to {VERSION})."
+            )
+        return _project_from_v2(data, project_dir)
+    return _project_from_v1(data, project_dir)
+
+
+def _project_from_v1(data: dict, project_dir: Path | None) -> Project:
+    raw_layers = data.get("layers", [])
+    if not isinstance(raw_layers, list):
+        raise ProjectFileError("'layers' must be a list.")
+    parsed = [_parse_layer(d, i, len(raw_layers)) for i, d in enumerate(raw_layers)]
+
+    image_info = data.get("image") or {}
+    if not isinstance(image_info, dict):
+        raise ProjectFileError("'image' must be an object.")
+    background = data.get("background") or {}
+    if not isinstance(background, dict):
+        raise ProjectFileError("'background' must be an object.")
+    view = data.get("view") or {}
+    if not isinstance(view, dict):
+        raise ProjectFileError("'view' must be an object.")
+
+    path = _resolve_image_path(image_info, project_dir)
+    has_image = path is not None or bool(parsed)
+    project = Project(
+        board=_parse_board(data),
+        checker_opacity=_parse_checker(data),
+    )
+    if has_image or _get_bool(background, "removed", False, "background"):
+        image = BaseImage(
+            name=_image_label(path),
+            path=path,
+            background_removed=_get_bool(background, "removed", False, "background"),
+            background_tolerance=_get_int(
+                background, "tolerance", DEFAULT_BG_TOLERANCE, 0, 255, "background"
+            ),
+            visible=_get_bool(view, "base_visible", True, "view"),
+        )
+        project.images.append(image)
+        _attach_layers(project, [(image, parsed)])
     return project
+
+
+def _project_from_v2(data: dict, project_dir: Path | None) -> Project:
+    raw_images = data["images"]
+    flat_raw: list[Any] = []
+    spans: list[tuple[dict, int]] = []
+    for index, raw in enumerate(raw_images):
+        where = f"images[{index}]"
+        if not isinstance(raw, dict):
+            raise ProjectFileError(f"{where} must be an object.")
+        raw_layers = raw.get("layers", [])
+        if not isinstance(raw_layers, list):
+            raise ProjectFileError(f"{where}: 'layers' must be a list.")
+        spans.append((raw, len(raw_layers)))
+        flat_raw.extend(raw_layers)
+
+    parsed = [_parse_layer(entry, i, len(flat_raw)) for i, entry in enumerate(flat_raw)]
+    project = Project(board=_parse_board(data), checker_opacity=_parse_checker(data))
+    groups: list[tuple[BaseImage, list[tuple[Layer, list[int]]]]] = []
+    offset = 0
+    for raw, count in spans:
+        path = _resolve_image_path(raw, project_dir)
+        name = raw.get("name")
+        if not isinstance(name, str) or not name.strip():
+            name = _image_label(path)
+        background = raw.get("background") or {}
+        if not isinstance(background, dict):
+            raise ProjectFileError("'background' must be an object.")
+        image = BaseImage(
+            name=name.strip(),
+            path=path,
+            background_removed=_get_bool(background, "removed", False, "background"),
+            background_tolerance=_get_int(
+                background, "tolerance", DEFAULT_BG_TOLERANCE, 0, 255, "background"
+            ),
+            visible=_get_bool(raw, "visible", True, "images"),
+        )
+        project.images.append(image)
+        groups.append((image, parsed[offset : offset + count]))
+        offset += count
+    _attach_layers(project, groups)
+    return project
+
+
+def _image_label(path: str | None) -> str:
+    if not path:
+        return "Base image"
+    return Path(path).name or "Base image"
 
 
 def load_project(path: str | Path) -> Project:

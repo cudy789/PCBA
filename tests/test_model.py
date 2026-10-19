@@ -29,11 +29,11 @@ def test_add_and_get_layer():
     assert project.get_layer(99999) is None
 
 
-def test_only_one_cut_layer_allowed():
+def test_any_number_of_cut_layers_are_allowed():
     project = Project()
-    project.add_layer(make_layer(LayerType.CUT))
-    with pytest.raises(ProjectError):
-        project.add_layer(make_layer(LayerType.CUT))
+    first = project.add_layer(make_layer(LayerType.CUT))
+    second = project.add_layer(make_layer(LayerType.CUT))
+    assert [layer.id for layer in project.cut_layers()] == [first.id, second.id]
 
 
 def test_cut_allowed_again_after_removal():

@@ -6,15 +6,21 @@ and a smooth board outline (Edge.Cuts).
 
 ## How it works
 
-1. **Open an image** (`File > Open image`, Ctrl+O). Transparency is preserved;
-   fully transparent pixels never match a layer color.
+1. **Open images**. `File > Add image` (Ctrl+I) adds a base image; repeat it
+   for as many as you need. `File > Open image` (Ctrl+O) replaces the image
+   that is selected in the Layers pane and keeps that image's layers.
+   Transparency is preserved; fully transparent pixels never match a layer
+   color. Images of different sizes share one canvas, aligned at the top-left.
+   The canvas is as wide as the widest image and as tall as the tallest, and
+   the board size in millimeters maps onto that whole canvas.
 2. **Add layers** with the *Add layer* button in the Layers pane. Each layer
    masks a single color of the base image and is one of:
    - **Copper** - exposed copper artwork
    - **Solder mask opening** - areas where the mask is removed
    - **Silkscreen** - printed legend artwork
-   - **Cut** - the board outline (only one allowed; it must be a single
-     contiguous perimeter)
+   - **Cut** - one closed board outline. A project may contain any number of
+     cut layers. Each one must be a single contiguous perimeter; export
+     unions them into the Edge.Cuts file.
 3. **Pick the layer's color** with any of:
    - the **eyedropper** (click a pixel on the canvas),
    - the **RGBA color dialog** (click the color swatch button),
@@ -34,31 +40,38 @@ and a smooth board outline (Edge.Cuts).
      has gaps, raise tolerance/gap closing.
    - *Cut smoothness* (cut layer only) - a 0-100 slider that smooths jagged
      pixel steps into a clean, rounded perimeter.
-5. **Manage layers**: **Base image** is the first row of the layer list.
-   Click it to open/replace the image, remove the background, and set
-   background tolerance. It stays put: it cannot be moved, duplicated, or
-   deleted. Click a layer to edit its mask. Each row has an **eye** on the
-   left: click the eye to show or hide that layer (or the base image)
-   without changing the selection. Rename a layer by double-clicking its
-   name; reorder with Up/Down; delete with Delete; **Duplicate** copies the
+5. **Manage layers**: each base image is a row in the layer list, and the
+   layers generated from it are nested underneath (indented). With one image
+   the row is titled **Base image**; with several, each row shows its file
+   name. Click a base image to add another image, replace that image, remove
+   it (and its layers), remove the background, and set background tolerance.
+   A base row cannot be moved or duplicated. Click a layer to edit its mask.
+   New layers are added under the image that owns the current row. Each row
+   has an **eye** on the left: click the eye to show or hide that layer (or
+   that base image) without changing the selection. The canvas draws every
+   visible base image, top-left aligned, with later images painted over
+   earlier ones. Rename a layer by double-clicking its name; reorder with
+   Up/Down within its image; delete with Delete; **Duplicate** copies the
    selected layer, including a negative's sources. The **Type** menu on a
    layer switches it between copper, solder mask opening, silkscreen, and
-   cut (still only one cut). **Invert** paints the opaque pixels that layer
-   does not cover. **Checker opacity** on the toolbar fades the
-   transparency checkerboard; it starts at 50%.
+   cut. **Invert** paints the opaque pixels that layer does not cover.
+   **Checker opacity** on the toolbar fades the transparency checkerboard;
+   it starts at 50%.
 6. **Generate a negative layer**: Ctrl/Shift-click several layers in the
-   Layers pane, then *Generate negative* and choose copper, mask opening, or
-   silkscreen. The new layer covers everything the selected layers do not
-   (within the opaque part of the image) and updates live when a source layer
-   changes. Deleting a source removes it from the negative; a negative left
-   with no sources is deleted too.
+   Layers pane (they may belong to different images), then *Generate negative*
+   and choose copper, mask opening, or silkscreen. The new layer is nested
+   under the image that owns the current row. It covers the opaque pixels of
+   the source images that the selected layers do not, and it updates live
+   when a source layer changes. Deleting a source removes it from the
+   negative; a negative left with no sources is deleted too.
 7. **Export** from `File > Export`. **Gerber files** (Ctrl+E) writes one file
    per layer into the output folder. **Gerber ZIP** (Ctrl+Shift+E) writes
    those same files into `<name>.zip`, named with the project name (the saved
    project file name, or the base name in the dialog). Choose the output
    folder, base name, and physical board size in millimeters (aspect ratio can
-   be locked to the image). Visible layers with the same type and side are
-   merged into one standard file:
+   be locked to the shared canvas). Visible layers with the same type and
+   side are merged into one standard file, taking the union across every
+   base image:
 
    | Layer | File |
    |---|---|
@@ -70,17 +83,26 @@ and a smooth board outline (Edge.Cuts).
    | Back silkscreen | `<name>-B_Silkscreen.gbo` |
    | Board outline | `<name>-Edge_Cuts.gm1` |
 
+   **Export image** opens a dialog listing every layer. Check the layers to
+   save as their own PNG (solid preview color where the layer is on,
+   transparent elsewhere). A cut layer is saved as its perimeter only.
+   **Export a fully rendered PCB image** writes one
+   extra picture of the finished board: green solder mask, copper showing
+   through the mask openings, white silkscreen on top, and a transparent
+   margin outside the cut outline. That picture includes every layer that
+   has a mask, including layers left unchecked and layers hidden in the view.
+
 ## Remove background
 
-Select **Base image** in the Layers pane and tick *Remove background*. That
-makes the image's outer contiguous background color transparent so it can't
-match any layer, then crops the image to the remaining artwork. The board
-size is mapped onto that cropped image, so the Gerber files fill the width
-and height you set instead of leaving the old transparent margin in the
-coordinates. The background is the most common border color, grown inward
-across 4-connected pixels within the tolerance spin. Same-colored regions
-enclosed by artwork (the inside of a letter, a hole in a shape) are kept.
-Untick to restore the original image; layers recompute either way.
+Select a base image in the Layers pane and tick *Remove background*. That
+makes that image's outer contiguous background color transparent so it can't
+match any layer, then crops the image to the remaining artwork. The shared
+canvas (and a locked board aspect) follows the cropped size. The background
+is the most common border color, grown inward across 4-connected pixels
+within the tolerance spin. Same-colored regions enclosed by artwork (the
+inside of a letter, a hole in a shape) are kept. Untick to restore the
+original image; layers recompute either way. Each image remembers its own
+background removal.
 
 The toolbar holds the **Checker opacity** slider (how strong the transparency
 grid is; it starts at 50%). Open, save, and export live in the File menu.
@@ -91,13 +113,17 @@ Show or hide the base image from the View menu.
 *File > Save project* (Ctrl+S / Ctrl+Shift+S) writes a human-readable JSON
 `.prj` file; *File > Open project* (Ctrl+Shift+O) restores where you left off:
 
-- every layer: name, type, side, color, tolerance, gap closing, min island,
-  fill holes, cut smoothness/perimeter, visibility, invert, and negative sources
+- every layer, nested under its base image: name, type, side, color,
+  tolerance, gap closing, min island, fill holes, cut smoothness/perimeter,
+  visibility, invert, and negative sources
 - layer order, board width/height, aspect lock, output folder, and base name
   (set via *File > Board settings* or the export dialog)
-- background-removal state and tolerance, and base-image visibility
-- the source image path (absolute plus relative to the `.prj`, so a project
-  folder can be moved; if the image is missing you are asked to locate it)
+- per image: background-removal state and tolerance, visibility, and the
+  source image path (absolute plus relative to the `.prj`, so a project
+  folder can be moved; if an image is missing you are asked to locate it)
+
+A project with one image is saved in the original version-1 layout. A project
+with several images is version 2. Version-1 files still open.
 
 The image itself is not embedded. Corrupt or unsupported files are rejected
 with a message and never overwrite the work currently open.

@@ -125,12 +125,14 @@ def test_deleting_a_source_removes_a_duplicated_negative_too(window):
     assert copy.id not in remaining
 
 
-def test_duplicate_cut_is_rejected(window, monkeypatch):
-    seen = warnings_of(monkeypatch)
+def test_duplicating_a_cut_adds_another_outline(window):
     cut = add(window, LayerType.CUT, BOARD_COLOR)
-    assert window.duplicate_layer(cut.id) is None
-    assert window.project.layers == [cut]
-    assert seen and "cut" in seen[0][1].lower() + seen[0][2].lower()
+    copy = window.duplicate_layer(cut.id)
+    window.flush_recompute()
+    assert copy is not None and copy.id != cut.id
+    assert copy.layer_type == LayerType.CUT
+    assert [layer.id for layer in window.project.cut_layers()] == [cut.id, copy.id]
+    assert cut.id in window.outlines and copy.id in window.outlines
 
 
 def test_duplicate_marks_the_project_modified(window, tmp_path):
@@ -174,6 +176,7 @@ def test_changing_to_cut_draws_an_outline_and_back_removes_it(window, tmp_path):
     window.flush_recompute()
     assert layer.is_cut
     assert layer.id in window.outlines
+    assert layer.id not in window.canvas.overlay_items
     assert window.inspector.outline_combo.isVisibleTo(window.inspector)
     assert not window.inspector.side_combo.isVisibleTo(window.inspector)
     names = {path.name for path in window.export_gerbers(tmp_path, "cut", 40, 30)}
@@ -183,20 +186,21 @@ def test_changing_to_cut_draws_an_outline_and_back_removes_it(window, tmp_path):
     window.flush_recompute()
     assert layer.layer_type == LayerType.COPPER
     assert layer.id not in window.outlines
+    assert layer.id in window.canvas.overlay_items
     names = {path.name for path in window.export_gerbers(tmp_path, "back", 40, 30)}
     assert "back-F_Cu.gtl" in names
     assert "back-Edge_Cuts.gm1" not in names
 
 
-def test_second_cut_via_the_type_combo_is_rejected_and_reverted(window, monkeypatch):
-    seen = warnings_of(monkeypatch)
+def test_a_layer_can_become_another_cut(window):
     add(window, LayerType.CUT, BOARD_COLOR)
     copper = add(window)
     choose_type(window, LayerType.CUT)
-    assert copper.layer_type == LayerType.COPPER
-    assert window.inspector.type_combo.currentData() == LayerType.COPPER
-    assert window.project.cut_layer() is not copper
-    assert seen
+    window.flush_recompute()
+    assert copper.layer_type == LayerType.CUT
+    assert window.inspector.type_combo.currentData() == LayerType.CUT
+    assert copper in window.project.cut_layers()
+    assert copper.id in window.outlines
 
 
 def test_a_negative_cannot_become_a_cut(window, monkeypatch):

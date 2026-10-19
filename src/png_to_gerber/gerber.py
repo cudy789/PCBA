@@ -170,12 +170,18 @@ def write_artwork_gerber(
     path.write_text("\n".join(lines) + "\n", encoding="ascii")
 
 
-def write_outline_gerber(
-    path: Path, outline: Polygon, transform: BoardTransform
-) -> None:
-    """Write a closed stroked perimeter as the Edge.Cuts profile."""
-    pts = _closed_ring(transform, outline.exterior)
-    if len(pts) < 3:
+def write_outline_gerber(path: Path, outline, transform: BoardTransform) -> None:
+    """Write closed stroked perimeters as the Edge.Cuts profile.
+
+    `outline` may be one polygon or a union of several. Each piece is its own
+    closed stroke, so cut layers that do not touch stay separate contours.
+    """
+    contours = []
+    for poly in iter_polygons(outline):
+        pts = _closed_ring(transform, poly.exterior)
+        if len(pts) >= 3:
+            contours.append(pts)
+    if not contours:
         raise ExportError("The board outline is not a closed polygon.")
     lines = _header(EDGE_CUTS_FILE[2], None)
     # Replace the dummy region aperture with the visible outline width.
@@ -183,10 +189,9 @@ def write_outline_gerber(
     lines += [
         f"%ADD10C,{OUTLINE_WIDTH_MM:.3f}*%",
         "D10*",
-        f"{_coord(pts[0])}D02*",
     ]
-    lines += [f"{_coord(p)}D01*" for p in pts[1:]]
-    lines.append(f"{_coord(pts[0])}D01*")
+    for pts in contours:
+        lines += _contour_commands(pts)
     lines.append("M02*")
     path.write_text("\n".join(lines) + "\n", encoding="ascii")
 
@@ -194,7 +199,7 @@ def write_outline_gerber(
 def export_project(
     project: Project,
     layer_geometries: dict[int, object],
-    cut_outline_polygon: Polygon | None,
+    cut_outline_polygon,
     out_dir: str | Path,
     base_name: str,
     transform: BoardTransform,
@@ -203,7 +208,8 @@ def export_project(
 
     `layer_geometries` maps layer id -> shapely geometry (image px coords).
     Visible artwork layers with the same (type, side) are unioned into one
-    standard file. The cut outline, when provided, becomes Edge_Cuts.
+    standard file. `cut_outline_polygon`, when provided, becomes Edge_Cuts;
+    a union of several cut outlines is stroked as one contour per piece.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

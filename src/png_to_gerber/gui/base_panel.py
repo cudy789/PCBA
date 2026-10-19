@@ -20,7 +20,12 @@ class BaseImagePanel(QWidget):
         self.info_label = QLabel("No image loaded.", self)
         self.info_label.setWordWrap(True)
 
+        self.add_button = QPushButton("Add image...", self)
+        self.add_button.setToolTip("Open another base image. Its layers are listed under it.")
         self.open_button = QPushButton("Open / replace image...", self)
+        self.remove_button = QPushButton("Remove image", self)
+        self.remove_button.setToolTip("Remove this base image and the layers nested under it.")
+        self.remove_button.setEnabled(False)
 
         self.remove_bg_check = QCheckBox("Remove background", self)
         self.remove_bg_check.setToolTip(
@@ -44,7 +49,9 @@ class BaseImagePanel(QWidget):
 
         form = QFormLayout(self)
         form.addRow(self.info_label)
+        form.addRow(self.add_button)
         form.addRow(self.open_button)
+        form.addRow(self.remove_button)
         form.addRow(self.remove_bg_check)
         form.addRow("Background tolerance", self.tolerance_spin)
         form.addRow(hint)

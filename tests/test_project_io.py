@@ -239,12 +239,12 @@ def test_malformed_fields_rejected(tmp_path, fn, match):
         load_project(mutate(tmp_path, fn))
 
 
-def test_two_cut_layers_rejected(tmp_path):
+def test_two_cut_layers_roundtrip(tmp_path):
     def add_cut(d):
         d["layers"].append(dict(d["layers"][1], name="Second outline"))
 
-    with pytest.raises(ProjectFileError, match="cut"):
-        load_project(mutate(tmp_path, add_cut))
+    loaded = load_project(mutate(tmp_path, add_cut))
+    assert [layer.name for layer in loaded.cut_layers()] == ["Outline", "Second outline"]
 
 
 def test_negative_cycle_rejected(tmp_path):

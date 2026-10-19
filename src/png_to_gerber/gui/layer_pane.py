@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..model import Layer, LayerType
+from ..model import BaseImage, Layer, LayerType
 from .icons import eye_icon
 
 LAYER_TYPE_LABELS = {
@@ -27,11 +27,14 @@ LAYER_TYPE_LABELS = {
 
 NEGATIVE_TYPES = (LayerType.COPPER, LayerType.MASK, LayerType.SILKSCREEN)
 
-# Stored on the base-image row so it can live in the list without being a layer.
+# Stored on every base-image row so it can live in the list without being a layer.
 BASE_ITEM_ID = "__base_image__"
 VISIBLE_ROLE = Qt.UserRole + 1
+IMAGE_ID_ROLE = Qt.UserRole + 2  # base image id, on both the base row and its layers
+LABEL_ROLE = Qt.UserRole + 3  # canonical base-row title; edits are reverted to this
 EYE_HIT_WIDTH = 28  # px from the item's left edge that toggles visibility
 BASE_ITEM_TEXT = "Base image"
+LAYER_INDENT = "    "
 
 
 def _layer_tooltip(layer: Layer) -> str:
@@ -69,8 +72,8 @@ class LayerPane(QWidget):
     remove_requested = Signal(int)  # layer id
     move_requested = Signal(int, int)  # layer id, delta
     selected = Signal(int)  # current layer id (-1 for none)
-    base_selected = Signal()  # the "Base image" row was selected
-    base_visibility_changed = Signal(bool)
+    base_selected = Signal(object)  # base image id, or None when no image is loaded
+    base_visibility_changed = Signal(object, bool)  # image id, visible
     visibility_changed = Signal(int, bool)
     renamed = Signal(int, str)
 
@@ -139,22 +142,48 @@ class LayerPane(QWidget):
 
     # ---- sync from model ------------------------------------------------------
 
-    def refresh(self, layers: list[Layer], selected_id: int | None = None) -> None:
+    def refresh(
+        self,
+        layers: list[Layer] | None = None,
+        selected_id: int | None = None,
+        images: list[BaseImage] | None = None,
+        selected_image_id: int | None = None,
+    ) -> None:
+        """Rebuild the list, nesting each image's layers under its row.
+
+        Passing `images` groups those images. Passing only `layers` keeps the
+        single "Base image" row used before a project has real images.
+        """
+        if images is None:
+            images = []
+            if layers:
+                holder = BaseImage(layers=list(layers))
+                images = [holder]
         self.list.blockSignals(True)
         self.list.clear()
-        base = self._make_base_item()
-        self.list.addItem(base)
-        chosen = base
-        for layer in layers:
-            item = QListWidgetItem(layer.name)
-            item.setData(Qt.UserRole, layer.id)
-            item.setFlags((item.flags() | Qt.ItemIsEditable) & ~Qt.ItemIsUserCheckable)
-            item.setToolTip(_layer_tooltip(layer))
-            self._show_visibility(item, layer.visible)
-            self.list.addItem(item)
-            if layer.id == selected_id:
-                chosen = item
-        self.list.setCurrentItem(chosen)
+        multiple = len(images) > 1
+        chosen = None
+        if not images:
+            chosen = self._make_base_item(None, BASE_ITEM_TEXT, True)
+            self.list.addItem(chosen)
+        for image in images:
+            label = image.name if multiple and image.name else BASE_ITEM_TEXT
+            base = self._make_base_item(image.id, label, image.visible)
+            self.list.addItem(base)
+            if chosen is None or image.id == selected_image_id:
+                chosen = base
+            for layer in image.layers:
+                item = QListWidgetItem(LAYER_INDENT + layer.name)
+                item.setData(Qt.UserRole, layer.id)
+                item.setData(IMAGE_ID_ROLE, image.id)
+                item.setFlags((item.flags() | Qt.ItemIsEditable) & ~Qt.ItemIsUserCheckable)
+                item.setToolTip(_layer_tooltip(layer))
+                self._show_visibility(item, layer.visible)
+                self.list.addItem(item)
+                if layer.id == selected_id:
+                    chosen = item
+        if chosen is not None:
+            self.list.setCurrentItem(chosen)
         self.list.blockSignals(False)
         self._update_buttons()
         self._emit_current()
@@ -185,15 +214,22 @@ class LayerPane(QWidget):
                 self.list.setCurrentItem(item)
                 return
 
-    def select_base(self) -> None:
-        """Select the base image row."""
-        item = self._base_item()
+    def current_image_id(self) -> int | None:
+        """Base image that owns the current row, or None when nothing is loaded."""
+        item = self.list.currentItem()
         if item is None:
-            self.base_selected.emit()
+            return None
+        return item.data(IMAGE_ID_ROLE)
+
+    def select_base(self, image_id: int | None = None) -> None:
+        """Select a base-image row. With no id, select the first one."""
+        item = self._base_item(image_id)
+        if item is None:
+            self.base_selected.emit(None)
             return
         if self.list.currentItem() is item:
             self._update_buttons()
-            self.base_selected.emit()
+            self.base_selected.emit(item.data(IMAGE_ID_ROLE))
             return
         self.list.setCurrentItem(item)
 
@@ -206,13 +242,24 @@ class LayerPane(QWidget):
     def is_base_visible(self) -> bool:
         return self._base_visible
 
-    def set_base_visible(self, visible: bool) -> None:
-        """Reflect base-image visibility without emitting a signal."""
-        self._base_visible = bool(visible)
-        item = self._base_item()
-        if item is not None and bool(item.data(VISIBLE_ROLE)) != self._base_visible:
+    def set_base_visible(self, visible: bool, image_id: int | None = None) -> None:
+        """Reflect base-image visibility without emitting a signal.
+
+        With no id, the first base row is updated (the single-image case).
+        """
+        self.show_image_visibility(image_id, visible)
+
+    def show_image_visibility(self, image_id: int | None, visible: bool) -> None:
+        """Update one base row's eye without emitting a signal."""
+        item = self._base_item(image_id)
+        if item is None:
+            self._base_visible = bool(visible)
+            return
+        if image_id is None or item is self._base_item():
+            self._base_visible = bool(visible)
+        if bool(item.data(VISIBLE_ROLE)) != bool(visible):
             self.list.blockSignals(True)
-            self._show_visibility(item, self._base_visible)
+            self._show_visibility(item, visible)
             self.list.blockSignals(False)
 
     def toggle_base_visibility(self) -> None:
@@ -243,6 +290,15 @@ class LayerPane(QWidget):
         if item is not None:
             item.setToolTip(_layer_tooltip(layer))
 
+    def show_layer_name(self, layer_id: int, name: str) -> None:
+        """Keep the indented label in step with the layer name."""
+        item = self._item_for(layer_id)
+        label = LAYER_INDENT + name
+        if item is not None and item.text() != label:
+            self.list.blockSignals(True)
+            item.setText(label)
+            self.list.blockSignals(False)
+
     def _item_for(self, layer_id: int) -> QListWidgetItem | None:
         for i in range(self.list.count()):
             item = self.list.item(i)
@@ -250,21 +306,26 @@ class LayerPane(QWidget):
                 return item
         return None
 
-    def _base_item(self) -> QListWidgetItem | None:
-        if self.list.count() == 0:
-            return None
-        item = self.list.item(0)
-        return item if self._is_base(item) else None
+    def _base_item(self, image_id: int | None = None) -> QListWidgetItem | None:
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            if not self._is_base(item):
+                continue
+            if image_id is None or item.data(IMAGE_ID_ROLE) == image_id:
+                return item
+        return None
 
     def _is_base(self, item: QListWidgetItem) -> bool:
         return item.data(Qt.UserRole) == BASE_ITEM_ID
 
-    def _make_base_item(self) -> QListWidgetItem:
-        item = QListWidgetItem(BASE_ITEM_TEXT)
+    def _make_base_item(self, image_id: int | None, label: str, visible: bool) -> QListWidgetItem:
+        item = QListWidgetItem(label)
         item.setData(Qt.UserRole, BASE_ITEM_ID)
+        item.setData(IMAGE_ID_ROLE, image_id)
+        item.setData(LABEL_ROLE, label)
         item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-        item.setToolTip("Source image. Click to open it or remove the background.")
-        self._show_visibility(item, self._base_visible)
+        item.setToolTip("Source image. Click to open it, add another, or remove the background.")
+        self._show_visibility(item, visible)
         return item
 
     def _show_visibility(self, item: QListWidgetItem, visible: bool) -> None:
@@ -280,8 +341,9 @@ class LayerPane(QWidget):
         self._show_visibility(item, visible)
         self.list.blockSignals(False)
         if self._is_base(item):
-            self._base_visible = visible
-            self.base_visibility_changed.emit(visible)
+            if item is self._base_item():
+                self._base_visible = visible
+            self.base_visibility_changed.emit(item.data(IMAGE_ID_ROLE), visible)
         else:
             self.visibility_changed.emit(item.data(Qt.UserRole), visible)
 
@@ -289,19 +351,32 @@ class LayerPane(QWidget):
 
     def _update_buttons(self):
         layer_id = self.current_layer_id()
-        row = self.list.currentRow()
         is_layer = layer_id != -1
         self.negative_button.setEnabled(bool(self.selected_ids()))
         self.duplicate_button.setEnabled(is_layer)
         self.delete_button.setEnabled(is_layer)
-        # Row 0 is the base image, which stays put. The first real layer is row 1.
-        self.up_button.setEnabled(is_layer and row > 1)
-        self.down_button.setEnabled(is_layer and 0 < row < self.list.count() - 1)
+        # A layer moves only among the layers nested under its own image.
+        if not is_layer:
+            self.up_button.setEnabled(False)
+            self.down_button.setEnabled(False)
+            return
+        item = self.list.currentItem()
+        image_id = item.data(IMAGE_ID_ROLE)
+        row = self.list.row(item)
+        sibling_rows = [
+            self.list.row(self.list.item(i))
+            for i in range(self.list.count())
+            if not self._is_base(self.list.item(i))
+            and self.list.item(i).data(IMAGE_ID_ROLE) == image_id
+        ]
+        self.up_button.setEnabled(bool(sibling_rows) and row > min(sibling_rows))
+        self.down_button.setEnabled(bool(sibling_rows) and row < max(sibling_rows))
 
     def _emit_current(self):
         item = self.list.currentItem()
         if item is None or self._is_base(item):
-            self.base_selected.emit()
+            image_id = None if item is None else item.data(IMAGE_ID_ROLE)
+            self.base_selected.emit(image_id)
         else:
             self.selected.emit(item.data(Qt.UserRole))
 
@@ -310,12 +385,16 @@ class LayerPane(QWidget):
 
     def _on_item_changed(self, item: QListWidgetItem):
         if self._is_base(item):
-            if item.text() != BASE_ITEM_TEXT:
+            label = item.data(LABEL_ROLE) or BASE_ITEM_TEXT
+            if item.text() != label:
                 self.list.blockSignals(True)
-                item.setText(BASE_ITEM_TEXT)
+                item.setText(label)
                 self.list.blockSignals(False)
             return
-        self.renamed.emit(item.data(Qt.UserRole), item.text())
+        text = item.text()
+        if text.startswith(LAYER_INDENT):
+            text = text[len(LAYER_INDENT) :]
+        self.renamed.emit(item.data(Qt.UserRole), text)
 
     def _on_negative(self, layer_type: LayerType):
         ids = self.selected_ids()

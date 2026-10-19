@@ -54,16 +54,11 @@ def test_add_layer_appears_in_pane_and_selected(window):
     assert window.inspector._layer is layer
 
 
-def test_single_cut_layer_enforced(window, monkeypatch):
-    from PySide6.QtWidgets import QMessageBox
-
-    warnings = []
-    monkeypatch.setattr(
-        QMessageBox, "warning", lambda *a, **k: warnings.append(a)
-    )
-    assert window.add_layer(LayerType.CUT) is not None
-    assert window.add_layer(LayerType.CUT) is None
-    assert warnings
+def test_multiple_cut_layers_can_be_added(window):
+    first = window.add_layer(LayerType.CUT)
+    second = window.add_layer(LayerType.CUT)
+    assert first is not None and second is not None
+    assert [layer.id for layer in window.project.cut_layers()] == [first.id, second.id]
 
 
 def test_delete_layer_removes_overlay(window):
@@ -183,6 +178,8 @@ def test_cut_layer_produces_outline(window):
     layer = add_colored_layer(window, LayerType.CUT, BOARD_COLOR)
     assert layer.id in window.outlines
     assert layer.id in window.canvas.outline_items
+    assert layer.id not in window.canvas.overlay_items
+    assert window.canvas.outline_items[layer.id].isVisible()
     outline = window.outlines[layer.id]
     assert outline.is_valid and outline.area > 0
 
