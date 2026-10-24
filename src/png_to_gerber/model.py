@@ -15,6 +15,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 DEFAULT_BG_TOLERANCE = 12
+DEFAULT_FLATTEN_COUNT = 4
+FLATTEN_COUNT_MIN = 2
+FLATTEN_COUNT_MAX = 12
+FLATTEN_SMOOTH_MAX = 5
 
 
 class LayerType(Enum):
@@ -95,6 +99,16 @@ class BoardSettings:
     base_name: str = ""
 
 
+def default_flatten_cutoffs() -> list[int]:
+    """Even brightness boundaries for the default four buckets."""
+    return [64, 128, 192]
+
+
+def default_flatten_colors() -> list:
+    """One unset override per default bucket (``None`` uses the live average)."""
+    return [None] * DEFAULT_FLATTEN_COUNT
+
+
 @dataclass
 class BaseImage:
     """One source image and the layers masked from it."""
@@ -103,9 +117,24 @@ class BaseImage:
     path: str | None = None
     background_removed: bool = False
     background_tolerance: int = DEFAULT_BG_TOLERANCE
+    flatten_enabled: bool = False
+    flatten_count: int = DEFAULT_FLATTEN_COUNT  # 2-12 colors
+    flatten_cutoffs: list[int] = field(default_factory=default_flatten_cutoffs)
+    # None = use that bucket's average color. Same length as flatten_count.
+    flatten_colors: list = field(default_factory=default_flatten_colors)
+    flatten_smooth: int = 0  # 0 off .. 5 strongest edge median
     visible: bool = True
     layers: list[Layer] = field(default_factory=list)
     id: int = field(default_factory=_next_image_id)
+
+
+def reset_flatten(image: BaseImage) -> None:
+    """Turn flattening off and restore the default buckets."""
+    image.flatten_enabled = False
+    image.flatten_count = DEFAULT_FLATTEN_COUNT
+    image.flatten_cutoffs = default_flatten_cutoffs()
+    image.flatten_colors = default_flatten_colors()
+    image.flatten_smooth = 0
 
 
 class Project:

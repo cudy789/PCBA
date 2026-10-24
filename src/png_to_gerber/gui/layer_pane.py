@@ -324,7 +324,9 @@ class LayerPane(QWidget):
         item.setData(IMAGE_ID_ROLE, image_id)
         item.setData(LABEL_ROLE, label)
         item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-        item.setToolTip("Source image. Click to open it, add another, or remove the background.")
+        item.setToolTip(
+            "Source image. Click to open it, add another, remove the background, or flatten colors."
+        )
         self._show_visibility(item, visible)
         return item
 

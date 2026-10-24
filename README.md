@@ -44,7 +44,8 @@ and a smooth board outline (Edge.Cuts).
    layers generated from it are nested underneath (indented). With one image
    the row is titled **Base image**; with several, each row shows its file
    name. Click a base image to add another image, replace that image, remove
-   it (and its layers), remove the background, and set background tolerance.
+   it (and its layers), remove the background, set background tolerance,
+   or flatten its colors.
    A base row cannot be moved or duplicated. Click a layer to edit its mask.
    New layers are added under the image that owns the current row. Each row
    has an **eye** on the left: click the eye to show or hide that layer (or
@@ -104,6 +105,26 @@ inside of a letter, a hole in a shape) are kept. Untick to restore the
 original image; layers recompute either way. Each image remembers its own
 background removal.
 
+## Flatten colors
+
+Select a base image in the Layers pane and tick *Flatten colors*. The image
+is reduced to a chosen number of colors (2–12) by brightness, after background
+removal, so transparent pixels stay transparent. A bar shows that brightness
+range: the histogram underneath is where the image's pixels sit, the colored
+segments are the buckets, and the notches are the cutoffs. Drag a notch to
+move a boundary; it cannot cross its neighbors. *Auto-place cutoffs* puts the
+notches between the strongest brightness peaks. *Reset to even spacing*
+spreads them evenly and keeps any colors you picked.
+
+Each bucket has a swatch. It starts as the average of the pixels in that
+bucket (an empty bucket is a gray at the middle of its range). Click a swatch
+to choose a different color; right-click it to go back to the average.
+*Edge smooth* (0–5) cleans speckles and jagged anti-aliased edges without
+inventing new colors. *Compare original* shows the image from before
+flattening so you can judge the cutoffs; layer masks keep using the flattened
+image. Untick *Flatten colors* to restore the source colors. Each image
+remembers its own settings.
+
 The toolbar holds the **Checker opacity** slider (how strong the transparency
 grid is; it starts at 50%). Open, save, and export live in the File menu.
 Show or hide the base image from the View menu.
@@ -118,9 +139,10 @@ Show or hide the base image from the View menu.
   visibility, invert, and negative sources
 - layer order, board width/height, aspect lock, output folder, and base name
   (set via *File > Board settings* or the export dialog)
-- per image: background-removal state and tolerance, visibility, and the
-  source image path (absolute plus relative to the `.prj`, so a project
-  folder can be moved; if an image is missing you are asked to locate it)
+- per image: background-removal state and tolerance, color flattening
+  (on/off, bucket count, cutoffs, color overrides, edge smooth), visibility,
+  and the source image path (absolute plus relative to the `.prj`, so a
+  project folder can be moved; if an image is missing you are asked to locate it)
 
 A project with one image is saved in the original version-1 layout. A project
 with several images is version 2. Version-1 files still open.

@@ -11,6 +11,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+from .flatten import even_cutoffs, flatten_image
 from .masking import color_distance
 
 
@@ -64,13 +65,30 @@ def crop_to_opaque(rgba: np.ndarray) -> np.ndarray:
     return rgba[y0:y1, x0:x1].copy()
 
 
-def working_image(original: np.ndarray, removed: bool, tolerance: int = 12) -> np.ndarray:
+def working_image(
+    original: np.ndarray,
+    removed: bool,
+    tolerance: int = 12,
+    *,
+    flatten: bool = False,
+    cutoffs: list[int] | None = None,
+    colors: list | None = None,
+    smooth: int = 0,
+) -> np.ndarray:
     """The image layers and Gerber export are built from.
 
     With background removal on, the outer background is cleared and the result
     is cropped to the remaining artwork, so a board sized to this image matches
-    the artwork instead of the transparent margin around it.
+    the artwork instead of the transparent margin around it. Color flattening,
+    when requested, runs after that crop so transparent background never
+    joins a bucket.
     """
-    if not removed:
-        return original
-    return crop_to_opaque(remove_background(original, tolerance))
+    image = original if not removed else crop_to_opaque(remove_background(original, tolerance))
+    if not flatten:
+        return image
+    return flatten_image(
+        image,
+        list(cutoffs) if cutoffs else even_cutoffs(4),
+        colors,
+        smooth,
+    )

@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 
 from .. import project_io
 from ..background import crop_to_opaque, remove_background, working_image
+from ..flatten import auto_cutoffs, even_cutoffs, histogram, palette_for
 from ..gerber import BoardTransform, ExportError, export_project
 from ..geometry import CutError, cut_outline, mask_to_geometry
 from ..image_export import (
@@ -42,6 +43,9 @@ from ..image_io import canvas_size as shared_canvas_size
 from ..image_io import dominant_colors, load_rgba, pad_top_left
 from ..masking import build_mask, invert_mask, negative_mask
 from ..model import (
+    FLATTEN_COUNT_MAX,
+    FLATTEN_COUNT_MIN,
+    FLATTEN_SMOOTH_MAX,
     Layer,
     LayerType,
     Project,
@@ -49,6 +53,7 @@ from ..model import (
     Side,
     default_layer_name,
     duplicate_layer_name,
+    reset_flatten,
 )
 from ..project_io import EXTENSION, ProjectFileError
 from .base_panel import BaseImagePanel
@@ -75,6 +80,7 @@ class MainWindow(QMainWindow):
         self._originals: dict[int, np.ndarray] = {}  # image id -> file pixels
         self._working: dict[int, np.ndarray] = {}  # image id -> pixels layers mask
         self._palettes: dict[int, list] = {}  # image id -> dominant colors of its working image
+        self._comparing: set[int] = set()  # image ids showing the pre-flatten canvas
         self.masks: dict[int, np.ndarray] = {}
         self.outlines: dict[int, object] = {}  # layer id -> shapely Polygon
         self._dirty_layers: set[int] = set()
@@ -216,6 +222,14 @@ class MainWindow(QMainWindow):
         self.base_panel.remove_bg_check.toggled.connect(self.remove_bg_action.setChecked)
         self.base_panel.tolerance_spin.valueChanged.connect(self._on_bg_tolerance)
         self.base_panel.tolerance_spin.setValue(self.project.background_tolerance)
+        self.base_panel.flatten_check.toggled.connect(self._on_flatten_toggled)
+        self.base_panel.count_spin.valueChanged.connect(self._on_flatten_count)
+        self.base_panel.cutoff_bar.cutoffs_changed.connect(self._on_flatten_cutoffs)
+        self.base_panel.auto_button.clicked.connect(self._on_auto_cutoffs)
+        self.base_panel.reset_button.clicked.connect(self._on_reset_cutoffs)
+        self.base_panel.smooth_slider.valueChanged.connect(self._on_flatten_smooth)
+        self.base_panel.compare_check.toggled.connect(self._on_compare_original)
+        self.base_panel.color_edited.connect(self._on_flatten_color)
 
     def _sync_base_controls(self):
         image = self.active_image()
@@ -230,7 +244,18 @@ class MainWindow(QMainWindow):
             self.base_panel.set_image_info(name, int(working.shape[1]), int(working.shape[0]))
         else:
             self.base_panel.set_image_info(name)
-        self.base_panel.sync(image.background_removed, image.background_tolerance)
+        cutoffs, colors, hist = self._flatten_preview(image)
+        self.base_panel.sync(
+            image.background_removed,
+            image.background_tolerance,
+            flatten_enabled=image.flatten_enabled,
+            flatten_count=image.flatten_count,
+            cutoffs=cutoffs,
+            colors=colors,
+            smooth=image.flatten_smooth,
+            histogram=hist,
+            compare=image.id in self._comparing and image.flatten_enabled,
+        )
         self._set_checked(self.base_visible_action, image.visible)
         self._set_checked(self.remove_bg_action, image.background_removed)
         if working is not None:
@@ -336,6 +361,8 @@ class MainWindow(QMainWindow):
             image.name = path.name
             image.path = str(path)
             image.background_removed = False
+            reset_flatten(image)
+            self._comparing.discard(image.id)
         self._originals[image.id] = original
         self._working[image.id] = original
         self._palettes.pop(image.id, None)
@@ -370,6 +397,7 @@ class MainWindow(QMainWindow):
         self._originals.pop(image_id, None)
         self._working.pop(image_id, None)
         self._palettes.pop(image_id, None)
+        self._comparing.discard(image_id)
         for layer_id in removed:
             self.masks.pop(layer_id, None)
             self.outlines.pop(layer_id, None)
@@ -383,7 +411,7 @@ class MainWindow(QMainWindow):
     def _refresh_canvas(self, fit: bool) -> None:
         """Redraw every base image on the shared top-left canvas."""
         pairs = [
-            (image.id, self._working[image.id])
+            (image.id, self._pixels_for_canvas(image))
             for image in self.project.images
             if image.id in self._working
         ]
@@ -405,6 +433,220 @@ class MainWindow(QMainWindow):
         self._working[image_id] = pixels
         self._palettes.pop(image_id, None)
         self._refresh_canvas(fit=fit)
+
+    def _prepared_image(self, image):
+        """Pixels after background removal and before color flattening."""
+        original = self._originals.get(image.id)
+        if original is None:
+            return None
+        if not image.background_removed:
+            return original
+        return crop_to_opaque(remove_background(original, image.background_tolerance))
+
+    def _compose_working(self, image) -> np.ndarray:
+        original = self._originals[image.id]
+        return working_image(
+            original,
+            image.background_removed,
+            image.background_tolerance,
+            flatten=image.flatten_enabled,
+            cutoffs=image.flatten_cutoffs,
+            colors=image.flatten_colors,
+            smooth=image.flatten_smooth,
+        )
+
+    def _rebuild_working(self, image, *, fit: bool | None = None) -> np.ndarray | None:
+        """Recompute one image's working pixels from its file and settings."""
+        if image.id not in self._originals:
+            return None
+        pixels = self._compose_working(image)
+        previous = self._working.get(image.id)
+        size_changed = previous is None or previous.shape[:2] != pixels.shape[:2]
+        self._store_working(image.id, pixels, fit=size_changed if fit is None else fit)
+        return pixels
+
+    def _pixels_for_canvas(self, image) -> np.ndarray:
+        """What the canvas draws for one image.
+
+        Compare-original shows the post-background image while layers keep
+        masking the flattened working image.
+        """
+        working = self._working[image.id]
+        if image.id in self._comparing and image.flatten_enabled:
+            prepared = self._prepared_image(image)
+            if prepared is not None and prepared.shape[:2] == working.shape[:2]:
+                return prepared
+        return working
+
+    def _flatten_signature(self, image):
+        return (
+            bool(image.flatten_enabled),
+            int(image.flatten_count),
+            tuple(int(value) for value in image.flatten_cutoffs),
+            tuple(None if color is None else tuple(color) for color in image.flatten_colors),
+            int(image.flatten_smooth),
+        )
+
+    def _align_flatten(self, image) -> None:
+        """Keep bucket count, cutoffs, and overrides the same length."""
+        count = min(FLATTEN_COUNT_MAX, max(FLATTEN_COUNT_MIN, int(image.flatten_count)))
+        image.flatten_count = count
+        cutoffs = [int(value) for value in image.flatten_cutoffs]
+        valid = len(cutoffs) == count - 1 and all(
+            1 <= cutoffs[index] <= 254 and (index == 0 or cutoffs[index] > cutoffs[index - 1])
+            for index in range(len(cutoffs))
+        )
+        if not valid:
+            prepared = self._prepared_image(image) if image.flatten_enabled else None
+            if prepared is not None and np.any(prepared[..., 3] > 0):
+                cutoffs = auto_cutoffs(histogram(prepared), count)
+            else:
+                cutoffs = even_cutoffs(count)
+        image.flatten_cutoffs = cutoffs
+        colors = list(image.flatten_colors)
+        if len(colors) < count:
+            colors.extend([None] * (count - len(colors)))
+        image.flatten_colors = colors[:count]
+        image.flatten_smooth = min(FLATTEN_SMOOTH_MAX, max(0, int(image.flatten_smooth)))
+
+    def _flatten_preview(self, image):
+        count = image.flatten_count
+        cutoffs = [int(value) for value in image.flatten_cutoffs]
+        if len(cutoffs) != count - 1:
+            cutoffs = even_cutoffs(count)
+        prepared = self._prepared_image(image)
+        if prepared is None:
+            grays = [(30 + index * 18, 30 + index * 18, 30 + index * 18) for index in range(count)]
+            return cutoffs, grays, np.zeros(256, dtype=np.int64)
+        return cutoffs, palette_for(prepared, cutoffs, image.flatten_colors), histogram(prepared)
+
+    def set_flatten(
+        self,
+        enabled: bool | None = None,
+        *,
+        count: int | None = None,
+        cutoffs: list[int] | None = None,
+        colors: list | None = None,
+        smooth: int | None = None,
+    ) -> None:
+        """Update the active image's flatten settings and rebuild its working pixels."""
+        image = self.active_image()
+        if image is None:
+            self.statusBar().showMessage("Open an image first.")
+            self._sync_base_controls()
+            return
+        before = self._flatten_signature(image)
+        if count is not None and int(count) != image.flatten_count:
+            count = int(count)
+            if cutoffs is None:
+                cutoffs = even_cutoffs(count)
+            if colors is None:
+                old = list(image.flatten_colors)
+                colors = [old[index] if index < len(old) else None for index in range(count)]
+            image.flatten_count = count
+        elif count is not None:
+            image.flatten_count = int(count)
+        if cutoffs is not None:
+            image.flatten_cutoffs = [int(value) for value in cutoffs]
+        if colors is not None:
+            image.flatten_colors = [
+                None if color is None else (int(color[0]), int(color[1]), int(color[2]))
+                for color in colors
+            ]
+        if smooth is not None:
+            image.flatten_smooth = int(smooth)
+        if enabled is not None:
+            image.flatten_enabled = bool(enabled)
+            if not image.flatten_enabled:
+                self._comparing.discard(image.id)
+        self._align_flatten(image)
+        changed = self._flatten_signature(image) != before
+        if changed:
+            self._mark_modified()
+        if changed and image.id in self._originals:
+            self._rebuild_working(image)
+        else:
+            self._sync_base_controls()
+
+    def _on_flatten_toggled(self, enabled: bool) -> None:
+        image = self.active_image()
+        if image is None:
+            if enabled:
+                self.base_panel.flatten_check.blockSignals(True)
+                self.base_panel.flatten_check.setChecked(False)
+                self.base_panel.flatten_check.blockSignals(False)
+                self.statusBar().showMessage("Open an image first.")
+            return
+        if enabled == image.flatten_enabled:
+            return
+        self.set_flatten(enabled)
+
+    def _on_flatten_count(self, count: int) -> None:
+        image = self.active_image()
+        if image is None or count == image.flatten_count:
+            return
+        self.set_flatten(count=count)
+
+    def _on_flatten_cutoffs(self, cutoffs) -> None:
+        image = self.active_image()
+        if image is None:
+            return
+        values = [int(value) for value in cutoffs]
+        if values == list(image.flatten_cutoffs):
+            return
+        self.set_flatten(cutoffs=values)
+
+    def _on_auto_cutoffs(self) -> None:
+        image = self.active_image()
+        prepared = self._prepared_image(image) if image is not None else None
+        if image is None or prepared is None:
+            self.statusBar().showMessage("Open an image first.")
+            return
+        cutoffs = auto_cutoffs(histogram(prepared), image.flatten_count)
+        if cutoffs == list(image.flatten_cutoffs):
+            self.statusBar().showMessage("Cutoffs already follow the histogram.")
+            return
+        self.set_flatten(cutoffs=cutoffs)
+
+    def _on_reset_cutoffs(self) -> None:
+        image = self.active_image()
+        if image is None:
+            return
+        cutoffs = even_cutoffs(image.flatten_count)
+        if cutoffs == list(image.flatten_cutoffs):
+            self.statusBar().showMessage("Cutoffs are already evenly spaced.")
+            return
+        self.set_flatten(cutoffs=cutoffs)
+
+    def _on_flatten_smooth(self, value: int) -> None:
+        image = self.active_image()
+        if image is None or value == image.flatten_smooth:
+            return
+        self.set_flatten(smooth=value)
+
+    def _on_compare_original(self, checked: bool) -> None:
+        image = self.active_image()
+        if image is None:
+            return
+        if checked and image.flatten_enabled:
+            self._comparing.add(image.id)
+        else:
+            self._comparing.discard(image.id)
+        self._refresh_canvas(fit=False)
+
+    def _on_flatten_color(self, index: int, rgb) -> None:
+        image = self.active_image()
+        if image is None or not 0 <= index < image.flatten_count:
+            return
+        colors = list(image.flatten_colors)
+        if len(colors) < image.flatten_count:
+            colors.extend([None] * (image.flatten_count - len(colors)))
+        colors = colors[: image.flatten_count]
+        new = None if rgb is None else (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+        if colors[index] == new:
+            return
+        colors[index] = new
+        self.set_flatten(colors=colors)
 
     def _colors_for(self, image_id: int) -> list:
         """Dominant colors of one working image, reused until that image changes."""
@@ -434,18 +676,17 @@ class MainWindow(QMainWindow):
         self._set_checked(self.remove_bg_action, enabled)
         if enabled:
             cleared = remove_background(original, image.background_tolerance)
-            removed = int(((original[..., 3] > 0) & (cleared[..., 3] == 0)).sum())
-            pixels = crop_to_opaque(cleared)
+            removed_px = int(((original[..., 3] > 0) & (cleared[..., 3] == 0)).sum())
+        pixels = self._rebuild_working(image)
+        if pixels is None:
+            return
+        if enabled:
             message = (
-                f"Background removed ({removed:,} px made transparent). "
+                f"Background removed ({removed_px:,} px made transparent). "
                 f"Image cropped to {pixels.shape[1]} x {pixels.shape[0]} px."
             )
         else:
-            pixels = original
             message = "Background restored."
-        previous = self._working.get(image.id)
-        size_changed = previous is None or previous.shape[:2] != pixels.shape[:2]
-        self._store_working(image.id, pixels, fit=size_changed)
         self.statusBar().showMessage(message)
 
     def _on_bg_tolerance(self, value: int):
@@ -846,12 +1087,11 @@ class MainWindow(QMainWindow):
         self._originals.clear()
         self._working.clear()
         self._palettes.clear()
+        self._comparing.clear()
         for image, original, candidate in loaded:
             image.path = str(candidate)
             self._originals[image.id] = original
-            self._working[image.id] = working_image(
-                original, image.background_removed, image.background_tolerance
-            )
+            self._working[image.id] = self._compose_working(image)
 
         self.checker_slider.blockSignals(True)
         self.checker_slider.setValue(project.checker_opacity)

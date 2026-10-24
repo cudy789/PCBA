@@ -101,6 +101,55 @@ def test_roundtrip_preserves_board_and_view_state(tmp_path):
     assert loaded.base_visible is False
 
 
+def test_roundtrip_preserves_flatten_settings(tmp_path):
+    project = sample_project()
+    image = project.images[0]
+    image.flatten_enabled = True
+    image.flatten_count = 5
+    image.flatten_cutoffs = [20, 40, 80, 160]
+    image.flatten_colors = [(9, 8, 7), None, (4, 5, 6), None, None]
+    image.flatten_smooth = 3
+    loaded = load_project(save_project(tmp_path / "flat.prj", project))
+    saved = loaded.images[0]
+    assert saved.flatten_enabled is True
+    assert saved.flatten_count == 5
+    assert saved.flatten_cutoffs == [20, 40, 80, 160]
+    assert saved.flatten_colors == [(9, 8, 7), None, (4, 5, 6), None, None]
+    assert saved.flatten_smooth == 3
+
+
+def test_missing_flatten_section_uses_defaults(tmp_path):
+    data = project_io.project_to_dict(sample_project())
+    del data["flatten"]
+    loaded = project_io.project_from_dict(data)
+    image = loaded.images[0]
+    assert image.flatten_enabled is False
+    assert image.flatten_count == 4
+    assert image.flatten_cutoffs == [64, 128, 192]
+    assert image.flatten_colors == [None, None, None, None]
+    assert image.flatten_smooth == 0
+
+
+@pytest.mark.parametrize(
+    "mutate, match",
+    [
+        (lambda raw: raw.__setitem__("cutoffs", [10]), "cutoffs"),
+        (lambda raw: raw.__setitem__("cutoffs", [80, 40, 200]), "cutoffs"),
+        (lambda raw: raw.__setitem__("cutoffs", [0, 128, 192]), "cutoffs"),
+        (lambda raw: raw.__setitem__("colors", [None, None]), "colors"),
+        (lambda raw: raw.__setitem__("colors", [[1, 2], None, None, None]), "color"),
+        (lambda raw: raw.__setitem__("smooth", 9), "smooth"),
+        (lambda raw: raw.__setitem__("enabled", "yes"), "enabled"),
+        (lambda raw: raw.__setitem__("count", 1), "count"),
+    ],
+)
+def test_malformed_flatten_rejected(tmp_path, mutate, match):
+    data = project_io.project_to_dict(sample_project())
+    mutate(data["flatten"])
+    with pytest.raises(ProjectFileError, match=match):
+        project_io.project_from_dict(data)
+
+
 def test_negative_references_are_remapped_to_new_ids(tmp_path):
     original = sample_project()
     loaded = load_project(save_project(tmp_path / "a.prj", original))

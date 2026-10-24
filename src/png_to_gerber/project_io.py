@@ -2,7 +2,8 @@
 
 A project with one base image is written as version 1: a single image path and
 a flat layer list. A project with several images is version 2: each image
-keeps its own layers, background removal, and visibility. Negative layers
+keeps its own layers, background removal, color flattening, and visibility.
+Negative layers
 refer to other layers by index in that flat list (version 2 indexes across
 every image, in order), so reloading assigns fresh runtime ids without
 breaking the references. Each source image is stored by absolute path plus a
@@ -17,8 +18,13 @@ import os
 from pathlib import Path
 from typing import Any
 
+from .flatten import even_cutoffs
 from .model import (
     DEFAULT_BG_TOLERANCE,
+    DEFAULT_FLATTEN_COUNT,
+    FLATTEN_COUNT_MAX,
+    FLATTEN_COUNT_MIN,
+    FLATTEN_SMOOTH_MAX,
     BaseImage,
     BoardSettings,
     Layer,
@@ -27,6 +33,8 @@ from .model import (
     Project,
     ProjectError,
     Side,
+    default_flatten_colors,
+    default_flatten_cutoffs,
 )
 
 FORMAT = "png_to_gerber_project"
@@ -74,6 +82,31 @@ def _path_dict(path: str | None, project_dir: Path | None) -> dict[str, Any]:
     return image
 
 
+def _flatten_dict(image: BaseImage | None) -> dict[str, Any]:
+    if image is None:
+        return {
+            "enabled": False,
+            "count": DEFAULT_FLATTEN_COUNT,
+            "cutoffs": default_flatten_cutoffs(),
+            "colors": default_flatten_colors(),
+            "smooth": 0,
+        }
+    count = image.flatten_count
+    colors = list(image.flatten_colors)
+    if len(colors) < count:
+        colors.extend([None] * (count - len(colors)))
+    stored = []
+    for color in colors[:count]:
+        stored.append(None if color is None else [int(color[0]), int(color[1]), int(color[2])])
+    return {
+        "enabled": bool(image.flatten_enabled),
+        "count": int(count),
+        "cutoffs": [int(value) for value in image.flatten_cutoffs],
+        "colors": stored,
+        "smooth": int(image.flatten_smooth),
+    }
+
+
 def _board_dict(board: BoardSettings) -> dict[str, Any]:
     return {
         "width_mm": board.width_mm,
@@ -97,6 +130,7 @@ def project_to_dict(project: Project, project_dir: Path | None = None) -> dict[s
                 "removed": image.background_removed if image else False,
                 "tolerance": image.background_tolerance if image else DEFAULT_BG_TOLERANCE,
             },
+            "flatten": _flatten_dict(image),
             "board": board,
             "view": {
                 "base_visible": image.visible if image else True,
@@ -113,6 +147,7 @@ def project_to_dict(project: Project, project_dir: Path | None = None) -> dict[s
             "removed": image.background_removed,
             "tolerance": image.background_tolerance,
         }
+        stored["flatten"] = _flatten_dict(image)
         stored["visible"] = image.visible
         stored["layers"] = [_layer_to_dict(layer, index_of) for layer in image.layers]
         images.append(stored)
@@ -258,6 +293,81 @@ def _parse_checker(data: dict) -> int:
     return _get_int(view, "checker_opacity", 50, 0, 100, "view")
 
 
+def _parse_rgb(value: Any, where: str) -> tuple[int, int, int]:
+    if (
+        not isinstance(value, list)
+        or len(value) != 3
+        or any(isinstance(channel, bool) or not isinstance(channel, int) or not 0 <= channel <= 255 for channel in value)
+    ):
+        raise ProjectFileError(f"{where}: each color must be three integers 0-255, or null.")
+    return (value[0], value[1], value[2])
+
+
+def _parse_flatten(source: dict, where: str) -> dict[str, Any]:
+    """Read an optional ``flatten`` object. Missing means the defaults."""
+    if "flatten" not in source or source.get("flatten") is None:
+        return {
+            "flatten_enabled": False,
+            "flatten_count": DEFAULT_FLATTEN_COUNT,
+            "flatten_cutoffs": default_flatten_cutoffs(),
+            "flatten_colors": default_flatten_colors(),
+            "flatten_smooth": 0,
+        }
+    raw = source.get("flatten")
+    if not isinstance(raw, dict):
+        raise ProjectFileError(f"{where}: 'flatten' must be an object.")
+    count = _get_int(raw, "count", DEFAULT_FLATTEN_COUNT, FLATTEN_COUNT_MIN, FLATTEN_COUNT_MAX, where)
+    if "cutoffs" in raw:
+        cutoffs = raw.get("cutoffs")
+        if (
+            not isinstance(cutoffs, list)
+            or len(cutoffs) != count - 1
+            or any(isinstance(value, bool) or not isinstance(value, int) for value in cutoffs)
+        ):
+            raise ProjectFileError(
+                f"{where}: 'cutoffs' must be {count - 1} integers from 1 to 254."
+            )
+        previous = 0
+        parsed_cutoffs: list[int] = []
+        for value in cutoffs:
+            if not 1 <= value <= 254 or value <= previous:
+                raise ProjectFileError(
+                    f"{where}: 'cutoffs' must be {count - 1} strictly increasing integers from 1 to 254."
+                )
+            parsed_cutoffs.append(value)
+            previous = value
+    else:
+        parsed_cutoffs = even_cutoffs(count)
+    if "colors" in raw:
+        colors = raw.get("colors")
+        if not isinstance(colors, list) or len(colors) != count:
+            raise ProjectFileError(f"{where}: 'colors' must be {count} colors or nulls.")
+        parsed_colors = []
+        for entry in colors:
+            if entry is None:
+                parsed_colors.append(None)
+            else:
+                parsed_colors.append(_parse_rgb(entry, where))
+    else:
+        parsed_colors = [None] * count
+    return {
+        "flatten_enabled": _get_bool(raw, "enabled", False, where),
+        "flatten_count": count,
+        "flatten_cutoffs": parsed_cutoffs,
+        "flatten_colors": parsed_colors,
+        "flatten_smooth": _get_int(raw, "smooth", 0, 0, FLATTEN_SMOOTH_MAX, where),
+    }
+
+
+def _apply_flatten(image: BaseImage, source: dict, where: str) -> None:
+    parsed = _parse_flatten(source, where)
+    image.flatten_enabled = parsed["flatten_enabled"]
+    image.flatten_count = parsed["flatten_count"]
+    image.flatten_cutoffs = parsed["flatten_cutoffs"]
+    image.flatten_colors = parsed["flatten_colors"]
+    image.flatten_smooth = parsed["flatten_smooth"]
+
+
 def _attach_layers(project: Project, images: list[tuple[BaseImage, list[tuple[Layer, list[int]]]]]) -> None:
     """Give each image its layers and remap negative indexes to fresh ids."""
     flat: list[Layer] = []
@@ -324,6 +434,7 @@ def _project_from_v1(data: dict, project_dir: Path | None) -> Project:
             ),
             visible=_get_bool(view, "base_visible", True, "view"),
         )
+        _apply_flatten(image, data, "flatten")
         project.images.append(image)
         _attach_layers(project, [(image, parsed)])
     return project
@@ -347,7 +458,7 @@ def _project_from_v2(data: dict, project_dir: Path | None) -> Project:
     project = Project(board=_parse_board(data), checker_opacity=_parse_checker(data))
     groups: list[tuple[BaseImage, list[tuple[Layer, list[int]]]]] = []
     offset = 0
-    for raw, count in spans:
+    for image_index, (raw, count) in enumerate(spans):
         path = _resolve_image_path(raw, project_dir)
         name = raw.get("name")
         if not isinstance(name, str) or not name.strip():
@@ -364,6 +475,24 @@ def _project_from_v2(data: dict, project_dir: Path | None) -> Project:
             ),
             visible=_get_bool(raw, "visible", True, "images"),
         )
+        _apply_flatten(image, raw, f"images[{image_index}].flatten")
+        path = _resolve_image_path(raw, project_dir)
+        name = raw.get("name")
+        if not isinstance(name, str) or not name.strip():
+            name = _image_label(path)
+        background = raw.get("background") or {}
+        if not isinstance(background, dict):
+            raise ProjectFileError("'background' must be an object.")
+        image = BaseImage(
+            name=name.strip(),
+            path=path,
+            background_removed=_get_bool(background, "removed", False, "background"),
+            background_tolerance=_get_int(
+                background, "tolerance", DEFAULT_BG_TOLERANCE, 0, 255, "background"
+            ),
+            visible=_get_bool(raw, "visible", True, "images"),
+        )
+        _apply_flatten(image, raw, f"images[{index}].flatten")
         project.images.append(image)
         groups.append((image, parsed[offset : offset + count]))
         offset += count

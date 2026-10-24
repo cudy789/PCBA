@@ -89,6 +89,11 @@ def test_a_negative_may_cite_layers_from_other_images():
 def test_version_two_project_roundtrips_every_image(tmp_path):
     project = Project()
     first = project.add_image("left.png", str(tmp_path / "left.png"), background_removed=True, background_tolerance=9)
+    first.flatten_enabled = True
+    first.flatten_count = 3
+    first.flatten_cutoffs = [40, 90]
+    first.flatten_colors = [(8, 8, 8), None, (1, 2, 3)]
+    first.flatten_smooth = 2
     second = project.add_image("right.png", str(tmp_path / "right.png"), visible=False)
     copper = project.add_layer(
         Layer(name="Copper 1", layer_type=LayerType.COPPER, has_color=True, color=(1, 2, 3)),
@@ -109,6 +114,12 @@ def test_version_two_project_roundtrips_every_image(tmp_path):
     assert data["version"] == 2 and "layers" not in data
     assert [image.name for image in loaded.images] == ["left.png", "right.png"]
     assert loaded.images[0].background_removed and loaded.images[0].background_tolerance == 9
+    assert loaded.images[0].flatten_enabled and loaded.images[0].flatten_count == 3
+    assert loaded.images[0].flatten_cutoffs == [40, 90]
+    assert loaded.images[0].flatten_colors == [(8, 8, 8), None, (1, 2, 3)]
+    assert loaded.images[0].flatten_smooth == 2
+    assert loaded.images[1].flatten_enabled is False
+    assert loaded.images[1].flatten_cutoffs == [64, 128, 192]
     assert loaded.images[1].visible is False
     assert loaded.images[1].layers[0].negative_of == [loaded.images[0].layers[0].id]
     assert loaded.images[1].layers[0].side == Side.BACK
