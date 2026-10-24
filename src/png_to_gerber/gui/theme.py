@@ -17,9 +17,17 @@ _MID = "#3f3f48"
 _HIGHLIGHT = "#4c6fff"
 
 
+_APPLIED = "_png_to_gerber_dark_theme"
+
+
 def apply_dark_theme(app: QApplication | None) -> None:
-    """Switch `app` to Fusion with a dark palette. Safe to call more than once."""
-    if app is None:
+    """Switch `app` to Fusion with a dark palette.
+
+    A later call on the same application does nothing. Applying the stylesheet
+    again would restyle every widget that already exists, which is most of the
+    cost of opening a window once the theme is already in place.
+    """
+    if app is None or getattr(app, _APPLIED, False):
         return
     app.setStyle("Fusion")
     palette = QPalette()
@@ -97,3 +105,4 @@ def apply_dark_theme(app: QApplication | None) -> None:
         }}
         """
     )
+    setattr(app, _APPLIED, True)

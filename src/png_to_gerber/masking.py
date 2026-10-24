@@ -51,8 +51,19 @@ def build_mask(
     - `min_island`: remove connected components smaller than this many px.
     - `fill_holes`: fill fully-enclosed holes in the mask.
     - `include_transparent`: when False, fully transparent pixels never match.
+      Partial opacity counts toward the same tolerance: the target color is
+      opaque, so a faint pixel must be correspondingly closer in RGB.
+      Nearly transparent pixels are often stored near black (cleared RGB, or
+      premultiplied edges of other colors), and an RGB-only test would
+      select that whole fringe for a black layer.
     """
     dist = color_distance(rgba, color) / 2.0
+    if not include_transparent:
+        # Quartered so the gap sits on the tolerance scale: an exact-color
+        # pixel at alpha 128 is 31.75 away (inside the default tolerance of
+        # 35) and one at alpha 32 is 55.75 away (outside it).
+        alpha = rgba[..., 3].astype(np.float32)
+        dist = np.hypot(dist, (255.0 - alpha) * 0.25)
     mask = (dist <= float(tolerance)).astype(np.uint8) * 255
 
     if not include_transparent:

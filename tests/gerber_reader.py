@@ -46,17 +46,16 @@ def read_regions(path: Path, image_w: int, image_h: int, width_mm: float, height
         x_mm, y_mm = xi / 1e6, yi / 1e6
         return x_mm * image_w / width_mm, image_h - y_mm * image_h / height_mm
 
-    image = Polygon()
+    pieces: list[tuple[str, Polygon]] = []
     polarity = "D"
     in_region = False
     ring: list[tuple[float, float]] = []
 
     def paint(contour: list[tuple[float, float]]) -> None:
-        nonlocal image
         region = _solid(contour)
         if region.is_empty:
             return
-        image = image.union(region) if polarity == "D" else image.difference(region)
+        pieces.append((polarity, region))
 
     for line in text.splitlines():
         line = line.strip()
@@ -78,6 +77,28 @@ def read_regions(path: Path, image_w: int, image_h: int, width_mm: float, height
                 ring = [point]
             else:
                 ring.append(point)
+    return _apply_polarity(pieces)
+
+
+def _apply_polarity(pieces: list[tuple[str, Polygon]]):
+    """Replay dark and clear regions.
+
+    A run of the same polarity is one union. That matches painting them one
+    at a time, and it stays cheap when a layer is hundreds of separate shapes.
+    """
+    image = Polygon()
+    start = 0
+    count = len(pieces)
+    while start < count:
+        polarity = pieces[start][0]
+        end = start + 1
+        while end < count and pieces[end][0] == polarity:
+            end += 1
+        batch = [region for _, region in pieces[start:end]]
+        merged = batch[0] if len(batch) == 1 else shapely.union_all(batch)
+        if not merged.is_empty:
+            image = image.union(merged) if polarity == "D" else image.difference(merged)
+        start = end
     return image
 
 

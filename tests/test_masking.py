@@ -41,6 +41,43 @@ def test_build_mask_excludes_transparent_pixels(fixture_rgba):
     assert mask[90, 120] == 255
 
 
+def test_black_does_not_match_nearly_transparent_pixels():
+    """Opacity is part of the match, so a black layer ignores faint pixels.
+
+    Low-alpha pixels are frequently stored near black. They used to fall
+    inside a normal tolerance of opaque black; solid black and a mostly
+    opaque edge of that color still match.
+    """
+    img = np.zeros((2, 4, 4), dtype=np.uint8)
+    img[..., 3] = 255
+    img[0, 0, :3] = (0, 0, 0)  # opaque black
+    img[0, 1, :3] = (0, 0, 0)
+    img[0, 1, 3] = 8  # nearly transparent, stored as black
+    img[0, 2, :3] = (12, 4, 6)
+    img[0, 2, 3] = 20  # faint premultiplied fringe of some other color
+    img[0, 3, :3] = (0, 0, 0)
+    img[0, 3, 3] = 220  # mostly opaque black edge
+    img[1, 0, :3] = (21, 15, 23)  # opaque near-black artwork
+    img[1, 1, :3] = (2, 3, 6)
+    img[1, 1, 3] = 10  # within RGB tolerance of the artwork color, but faint
+    img[1, 2, :3] = (10, 10, 10)  # opaque, within tolerance
+    img[1, 3, :3] = (255, 0, 0)  # opaque red
+
+    mask = build_mask(img, (0, 0, 0), tolerance=35, close_radius=0, min_island=0)
+    assert mask[0, 0] == 255
+    assert mask[0, 1] == 0
+    assert mask[0, 2] == 0
+    assert mask[0, 3] == 255
+    assert mask[1, 2] == 255
+    assert mask[1, 3] == 0
+
+    artwork = build_mask(
+        img, (21, 15, 23), tolerance=35, close_radius=0, min_island=0
+    )
+    assert artwork[1, 0] == 255
+    assert artwork[1, 1] == 0
+
+
 def test_build_mask_include_transparent_opt_in(fixture_rgba):
     mask = build_mask(
         fixture_rgba, (0, 0, 0), tolerance=10, close_radius=0,
