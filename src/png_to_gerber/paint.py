@@ -12,6 +12,7 @@ interior empty. The fill tool is a flood fill and does not use the brush size.
 
 from __future__ import annotations
 
+import math
 from enum import Enum
 
 import cv2
@@ -93,6 +94,47 @@ def stroke(target: np.ndarray, x0: int, y0: int, x1: int, y1: int, diameter: int
     """Stamp a disk at every pixel of the segment so the stroke has no gaps."""
     for x, y in line_points(x0, y0, x1, y1):
         stamp(target, x, y, diameter, value)
+
+
+# tan(22.5°): the boundary between an axis and the neighboring diagonal.
+_TAN_HALF_STEP = math.tan(math.pi / 8)
+
+
+def snap_line_end(x0: int, y0: int, x1: int, y1: int) -> tuple[int, int]:
+    """Move `(x1, y1)` so the segment from `(x0, y0)` sits on a 45-degree step.
+
+    The eight directions are the axes and the diagonals. The segment keeps
+    the direction closest to the cursor and ends near the cursor's distance.
+    """
+    x0, y0, x1, y1 = (int(v) for v in (x0, y0, x1, y1))
+    dx, dy = x1 - x0, y1 - y0
+    adx, ady = abs(dx), abs(dy)
+    if adx == 0 and ady == 0:
+        return x0, y0
+    if ady <= adx * _TAN_HALF_STEP:
+        return x0 + dx, y0
+    if adx <= ady * _TAN_HALF_STEP:
+        return x0, y0 + dy
+    step = (adx + ady + 1) // 2
+    sx = 1 if dx > 0 else -1
+    sy = 1 if dy > 0 else -1
+    return x0 + sx * step, y0 + sy * step
+
+
+def snap_square_corner(x0: int, y0: int, x1: int, y1: int) -> tuple[int, int]:
+    """Move the second corner so both sides match the longer one.
+
+    The square stays in the cursor's quadrant and grows or shrinks with it.
+    A cursor sitting on an axis extends the other side downward or rightward.
+    """
+    x0, y0, x1, y1 = (int(v) for v in (x0, y0, x1, y1))
+    dx, dy = x1 - x0, y1 - y0
+    side = max(abs(dx), abs(dy))
+    if side == 0:
+        return x1, y1
+    sx = 1 if dx >= 0 else -1
+    sy = 1 if dy >= 0 else -1
+    return x0 + sx * side, y0 + sy * side
 
 
 def stroke_rectangle(

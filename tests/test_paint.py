@@ -15,6 +15,8 @@ from png_to_gerber.paint import (
     flood_fill_rgba,
     flood_region,
     runs_from_edits,
+    snap_line_end,
+    snap_square_corner,
     stamp,
     stroke,
 )
@@ -69,6 +71,22 @@ def test_rectangle_strokes_the_outline_and_brush_size_thickens_it():
     stroke_rectangle(dot, 8, 8, 8, 8, 1, 255)
     assert dot[8, 8] == 255
     assert dot.sum() == 255
+
+
+def test_line_snap_uses_axes_and_diagonals():
+    assert snap_line_end(10, 20, 30, 24) == (30, 20)  # shallow, so horizontal
+    assert snap_line_end(10, 20, 14, 40) == (10, 40)  # steep, so vertical
+    assert snap_line_end(10, 40, 26, 30) == (23, 27)  # nearest diagonal
+    assert snap_line_end(5, 5, 15, 15) == (15, 15)  # already 45 degrees
+    assert snap_line_end(8, 8, 0, 9) == (0, 8)  # shallow the other way
+    assert snap_line_end(4, 4, 4, 4) == (4, 4)
+
+
+def test_square_snap_matches_the_longer_side_and_follows_the_cursor():
+    assert snap_square_corner(20, 30, 40, 36) == (40, 50)
+    assert snap_square_corner(20, 30, 28, 34) == (28, 38)  # a smaller square
+    assert snap_square_corner(20, 30, 12, 40) == (10, 40)  # left and down
+    assert snap_square_corner(20, 30, 20, 30) == (20, 30)
 
 
 def test_erase_overwrites_paint_and_apply_edits_forces_the_mask():

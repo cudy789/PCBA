@@ -297,6 +297,82 @@ def test_rectangle_tool_commits_on_the_second_click(window, qtbot):
     assert view._rect_anchor is None
 
 
+def _drag_line(view, start, end, modifiers=Qt.NoModifier):
+    view.mousePressEvent(_mouse(QEvent.Type.MouseButtonPress, start, modifiers=modifiers))
+    view.mouseMoveEvent(
+        _mouse(QEvent.Type.MouseMove, end, buttons=Qt.LeftButton, modifiers=modifiers)
+    )
+    view.mouseReleaseEvent(
+        _mouse(QEvent.Type.MouseButtonRelease, end, button=Qt.LeftButton, modifiers=modifiers)
+    )
+
+
+def test_ctrl_snaps_a_line_to_45_degrees_and_a_rectangle_to_a_square(window, qtbot):
+    layer = window.add_layer(LayerType.COPPER)
+    window.set_brush_size(1)
+    window.set_paint_tool(Tool.LINE)
+    window.show()
+    qtbot.waitExposed(window)
+    view = window.canvas
+    view.resetTransform()
+    view.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+    view.horizontalScrollBar().setValue(0)
+    view.verticalScrollBar().setValue(0)
+
+    def at(x, y):
+        return view.mapFromScene(QPointF(float(x), float(y)))
+
+    _drag_line(view, at(10, 20), at(30, 24))
+    mask = _mask(window, layer)
+    assert mask[23, 25] == 255  # the free line climbs off the start row
+    assert mask[20, 30] == 0
+
+    _drag_line(view, at(10, 40), at(26, 30), modifiers=Qt.ControlModifier)
+    mask = _mask(window, layer)
+    assert mask[27, 23] == 255  # snapped diagonal
+    assert mask[30, 26] == 0  # the cursor itself is not the endpoint
+
+    window.set_paint_tool(Tool.RECTANGLE)
+    first, second = at(20, 60), at(44, 68)
+    view.mousePressEvent(_mouse(QEvent.Type.MouseButtonPress, first))
+    view.mouseReleaseEvent(_mouse(QEvent.Type.MouseButtonRelease, first, button=Qt.LeftButton))
+    view.mouseMoveEvent(
+        _mouse(QEvent.Type.MouseMove, second, button=Qt.NoButton, buttons=Qt.NoButton, modifiers=Qt.ControlModifier)
+    )
+    view.mousePressEvent(_mouse(QEvent.Type.MouseButtonPress, second, modifiers=Qt.ControlModifier))
+    mask = _mask(window, layer)
+    assert mask[60, 44] == 255  # top-right of the square
+    assert mask[84, 32] == 255  # bottom side, past the cursor's y
+    assert mask[68, 32] == 0  # cursor row is inside the square
+    assert mask[72, 32] == 0
+
+
+def test_ctrl_key_resnaps_a_line_before_it_is_released(window, qtbot):
+    layer = window.add_layer(LayerType.COPPER)
+    window.set_brush_size(1)
+    window.set_paint_tool(Tool.LINE)
+    window.show()
+    qtbot.waitExposed(window)
+    view = window.canvas
+    view.resetTransform()
+    view.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+    view.horizontalScrollBar().setValue(0)
+    view.verticalScrollBar().setValue(0)
+
+    def at(x, y):
+        return view.mapFromScene(QPointF(float(x), float(y)))
+
+    start, end = at(50, 20), at(70, 24)
+    view.mousePressEvent(_mouse(QEvent.Type.MouseButtonPress, start))
+    view.mouseMoveEvent(_mouse(QEvent.Type.MouseMove, end, buttons=Qt.LeftButton))
+    view.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key_Control, Qt.NoModifier))
+    view.mouseReleaseEvent(_mouse(QEvent.Type.MouseButtonRelease, end, button=Qt.LeftButton))
+    mask = _mask(window, layer)
+    assert mask[20, 70] == 255
+    assert mask[20, 60] == 255
+    assert mask[22, 60] == 0
+
+
 def test_brush_cursor_matches_the_diameter_and_hides_for_fill(window, qtbot):
     window.set_brush_size(9)
     window.set_paint_tool(Tool.BRUSH)
@@ -319,11 +395,11 @@ def test_brush_cursor_matches_the_diameter_and_hides_for_fill(window, qtbot):
     assert not view._brush_cursor.isVisible()
 
 
-def _mouse(kind, pos, button=Qt.LeftButton, buttons=None):
+def _mouse(kind, pos, button=Qt.LeftButton, buttons=None, modifiers=Qt.NoModifier):
     if buttons is None:
         buttons = Qt.NoButton if kind == QEvent.Type.MouseButtonRelease else button
     point = QPointF(pos)
-    return QMouseEvent(kind, point, point, button, buttons, Qt.NoModifier)
+    return QMouseEvent(kind, point, point, button, buttons, modifiers)
 
 
 # ---- base image --------------------------------------------------------------------

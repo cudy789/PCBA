@@ -38,11 +38,12 @@ QPushButton:disabled {
 
 _TOOLS = (
     (Tool.BRUSH, "Paintbrush", "Drag to add pixels.", brush_icon),
-    (Tool.LINE, "Straight line", "Drag from one point to another.", line_icon),
+    (Tool.LINE, "Straight line", "Drag from one point to another. Hold Ctrl to snap to 45-degree steps.", line_icon),
     (
         Tool.RECTANGLE,
         "Rectangle",
-        "Click one corner, then the opposite corner. Only the outline is drawn. Esc cancels.",
+        "Click one corner, then the opposite corner. Only the outline is drawn. "
+        "Hold Ctrl to lock a square. Esc cancels.",
         rectangle_icon,
     ),
     (Tool.ERASE, "Eraser", "Drag to remove pixels.", eraser_icon),

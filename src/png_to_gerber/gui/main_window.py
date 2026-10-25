@@ -1030,10 +1030,10 @@ class MainWindow(QMainWindow):
             {
                 Tool.PAN: "Drag to pan. Scroll to zoom. Middle-drag pans while a paint tool is active.",
                 Tool.BRUSH: "Paintbrush: drag to add pixels.",
-                Tool.LINE: "Straight line: drag from one point to another.",
+                Tool.LINE: "Straight line: drag from one point to another. Hold Ctrl to snap to 45-degree steps.",
                 Tool.RECTANGLE: (
                     "Rectangle: click one corner, then the opposite corner. "
-                    "Only the outline is drawn. Esc cancels."
+                    "Only the outline is drawn. Hold Ctrl to lock a square. Esc cancels."
                 ),
                 Tool.ERASE: "Eraser: drag to remove pixels.",
                 Tool.FILL: "Fill: click an area. Brush size does not apply.",
@@ -1296,7 +1296,14 @@ class MainWindow(QMainWindow):
             self.canvas.cancel_rectangle()
             event.accept()
             return
+        if event.key() == Qt.Key_Control and not event.isAutoRepeat():
+            self.canvas.set_constrained(True)
         super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == Qt.Key_Control and not event.isAutoRepeat():
+            self.canvas.set_constrained(False)
+        super().keyReleaseEvent(event)
 
     # ---- recompute engine ------------------------------------------------------------
 

@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QGraphicsView,
 )
 
-from ..paint import Tool
+from ..paint import Tool, snap_line_end, snap_square_corner
 
 # Preview tints per layer type (RGB).
 TINTS = {
@@ -99,6 +99,8 @@ class ImageCanvas(QGraphicsView):
         self._line_start: tuple[int, int] | None = None
         self._line_end: tuple[int, int] | None = None
         self._rect_anchor: tuple[int, int] | None = None
+        self._rect_cursor: tuple[int, int] | None = None
+        self._constrained = False
         self._preview: QGraphicsPathItem | None = None
         self._brush_cursor: QGraphicsEllipseItem | None = None
         self._brush_diameter = 1
@@ -129,6 +131,7 @@ class ImageCanvas(QGraphicsView):
         self._line_start = None
         self._line_end = None
         self._rect_anchor = None
+        self._rect_cursor = None
         max_w = max((int(rgba.shape[1]) for _, rgba in images), default=0)
         max_h = max((int(rgba.shape[0]) for _, rgba in images), default=0)
         for z, (image_id, rgba) in enumerate(images):
@@ -264,7 +267,34 @@ class ImageCanvas(QGraphicsView):
 
     def cancel_rectangle(self) -> None:
         self._rect_anchor = None
+        self._rect_cursor = None
         self.clear_stroke_preview()
+
+    def set_constrained(self, constrained: bool) -> None:
+        """Snap the line or rectangle in progress while Ctrl is held."""
+        self._constrained = bool(constrained)
+        self._refresh_snap_preview()
+
+    def _control_held(self, event) -> bool:
+        return self._constrained or bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+
+    def _snap_line(self, x: int, y: int, constrained: bool) -> tuple[int, int]:
+        if not constrained or self._line_start is None:
+            return x, y
+        return snap_line_end(self._line_start[0], self._line_start[1], x, y)
+
+    def _snap_rect(self, x: int, y: int, constrained: bool) -> tuple[int, int]:
+        if not constrained or self._rect_anchor is None:
+            return x, y
+        return snap_square_corner(self._rect_anchor[0], self._rect_anchor[1], x, y)
+
+    def _refresh_snap_preview(self) -> None:
+        if self._line_start is not None and self._line_end is not None:
+            end = self._snap_line(*self._line_end, self._constrained)
+            self.set_stroke_preview([self._line_start, end])
+        if self._rect_anchor is not None and self._rect_cursor is not None:
+            corner = self._snap_rect(*self._rect_cursor, self._constrained)
+            self._preview_rectangle(*corner)
 
     def _shows_brush_cursor(self) -> bool:
         return not self.eyedropper_active and self.tool in (
@@ -353,10 +383,13 @@ class ImageCanvas(QGraphicsView):
             elif self.tool == Tool.RECTANGLE:
                 if self._rect_anchor is None:
                     self._rect_anchor = (x, y)
+                    self._rect_cursor = (x, y)
                     self._preview_rectangle(x, y)
                 else:
                     x0, y0 = self._rect_anchor
+                    x, y = self._snap_rect(x, y, self._control_held(event))
                     self._rect_anchor = None
+                    self._rect_cursor = None
                     self.clear_stroke_preview()
                     self.rectangle_committed.emit(x0, y0, x, y)
             else:
@@ -383,11 +416,13 @@ class ImageCanvas(QGraphicsView):
             return
         if self._line_start is not None and xy is not None:
             self._line_end = xy
-            self.set_stroke_preview([self._line_start, xy])
+            end = self._snap_line(*xy, self._control_held(event))
+            self.set_stroke_preview([self._line_start, end])
             event.accept()
             return
         if self.tool == Tool.RECTANGLE and self._rect_anchor is not None and xy is not None:
-            self._preview_rectangle(*xy)
+            self._rect_cursor = xy
+            self._preview_rectangle(*self._snap_rect(*xy, self._control_held(event)))
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -399,7 +434,8 @@ class ImageCanvas(QGraphicsView):
             event.accept()
             return
         if self._line_start is not None and event.button() == Qt.LeftButton:
-            end = self._image_xy(event) or self._line_end or self._line_start
+            raw = self._image_xy(event) or self._line_end or self._line_start
+            end = self._snap_line(*raw, self._control_held(event))
             start = self._line_start
             self._line_start = None
             self._line_end = None
@@ -422,6 +458,20 @@ class ImageCanvas(QGraphicsView):
             self._cursor_xy = None
             self._place_brush_cursor()
         return super().viewportEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Control and not event.isAutoRepeat():
+            self.set_constrained(True)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == Qt.Key_Control and not event.isAutoRepeat():
+            self.set_constrained(False)
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
 
     def wheelEvent(self, event):
         factor = 1.25 if event.angleDelta().y() > 0 else 0.8
