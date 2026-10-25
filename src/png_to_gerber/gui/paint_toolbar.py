@@ -1,4 +1,4 @@
-"""Left-hand paint tools: brush, line, rectangle, eraser, fill, and one brush size."""
+"""Left-hand tools: pan, brush, line, rectangle, eraser, fill, and one brush size."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..paint import BRUSH_SIZE_DEFAULT, BRUSH_SIZE_MAX, BRUSH_SIZE_MIN, Tool
-from .icons import brush_icon, color_swatch_icon, eraser_icon, fill_icon, line_icon, rectangle_icon
+from .icons import brush_icon, color_swatch_icon, eraser_icon, fill_icon, hand_icon, line_icon, rectangle_icon
 
 _BUTTON_STYLE = """
 QPushButton {
@@ -37,6 +37,7 @@ QPushButton:disabled {
 """
 
 _TOOLS = (
+    (Tool.PAN, "Pan", "Drag to move the view. Scroll to zoom.", hand_icon),
     (Tool.BRUSH, "Paintbrush", "Drag to add pixels.", brush_icon),
     (Tool.LINE, "Straight line", "Drag from one point to another. Hold Ctrl to snap to 45-degree steps.", line_icon),
     (
@@ -184,8 +185,8 @@ class PaintToolbar(QWidget):
             )
 
     def _on_clicked(self, tool: Tool) -> None:
-        # Clicking the active tool returns to pan, so left-drag can move the view.
-        if self._tool == tool:
+        # Clicking the active paint tool returns to pan. Pan itself stays selected.
+        if self._tool == tool and tool != Tool.PAN:
             self.set_tool(Tool.PAN)
         else:
             self.set_tool(tool)

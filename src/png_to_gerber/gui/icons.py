@@ -51,6 +51,20 @@ def _tool_icon(draw) -> QIcon:
     return QIcon(pixmap)
 
 
+def hand_icon() -> QIcon:
+    """An open hand for pan mode."""
+
+    def draw(painter: QPainter) -> None:
+        painter.drawRoundedRect(8, 5, 2, 8, 1, 1)
+        painter.drawRoundedRect(11, 4, 2, 9, 1, 1)
+        painter.drawRoundedRect(14, 5, 2, 8, 1, 1)
+        painter.drawRoundedRect(7, 12, 10, 7, 2, 2)
+        painter.drawLine(QPointF(7, 15), QPointF(4, 12))
+        painter.drawLine(QPointF(4, 12), QPointF(4, 10))
+
+    return _tool_icon(draw)
+
+
 def brush_icon() -> QIcon:
     """A diagonal stroke with a round tip."""
 

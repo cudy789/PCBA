@@ -33,13 +33,17 @@ def test_tools_live_on_a_left_toolbar_and_share_one_size(window, qtbot):
     sliders = window.paint_toolbar.findChildren(QSlider)
     assert len(sliders) == 1
 
-    for tool in (Tool.BRUSH, Tool.LINE, Tool.RECTANGLE, Tool.ERASE, Tool.FILL):
+    for tool in (Tool.PAN, Tool.BRUSH, Tool.LINE, Tool.RECTANGLE, Tool.ERASE, Tool.FILL):
         button = window.paint_toolbar.button(tool)
         assert button.isEnabled()
         assert button.toolTip()
 
+    assert window.paint_toolbar.button(Tool.PAN).isChecked()
+    assert window.canvas.tool == Tool.PAN
+
     qtbot.mouseClick(window.paint_toolbar.button(Tool.BRUSH), Qt.LeftButton)
     assert window.canvas.tool == Tool.BRUSH
+    assert not window.paint_toolbar.button(Tool.PAN).isChecked()
     assert window.paint_toolbar.size_slider.isEnabled()
 
     window.set_paint_tool(Tool.FILL)
@@ -49,7 +53,12 @@ def test_tools_live_on_a_left_toolbar_and_share_one_size(window, qtbot):
 
     qtbot.mouseClick(window.paint_toolbar.button(Tool.RECTANGLE), Qt.LeftButton)
     assert window.canvas.tool == Tool.PAN
+    assert window.paint_toolbar.button(Tool.PAN).isChecked()
     assert window.paint_toolbar.size_slider.isEnabled()
+
+    qtbot.mouseClick(window.paint_toolbar.button(Tool.PAN), Qt.LeftButton)
+    assert window.canvas.tool == Tool.PAN
+    assert window.paint_toolbar.button(Tool.PAN).isChecked()
 
     window.resize(1000, 700)
     window.show()

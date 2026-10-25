@@ -137,12 +137,15 @@ Show or hide the base image from the View menu.
 ## Paint
 
 The left toolbar paints pixels by hand. Select a layer to edit that layer's
-mask, or select the base image to edit its pixels. The tools are a
-**paintbrush**, a **straight line** (hold Ctrl to snap to 45-degree steps), a
-**rectangle** (click one corner, then the opposite corner; only the outline is
-drawn, and Ctrl locks it to a square), an **eraser**, and a **fill**
-bucket. One **Brush Size** slider, or a typed number, sets the diameter for every tool except fill. Click the active tool
-again to pan with the left button; middle-drag pans while a tool is active.
+mask, or select the base image to edit its pixels. The **hand** is pan: drag
+moves the view. The other tools are a **paintbrush**, a **straight line**
+(hold Ctrl to snap to 45-degree steps), a **rectangle** (click one corner, then
+the opposite corner; only the outline is drawn, and Ctrl locks it to a square),
+an **eraser**, and a **fill** bucket. One **Brush Size** slider, or a typed
+number, sets the diameter for every tool except fill. Click the active tool
+again, or click the hand, to pan with the left button; middle-drag pans while
+a tool is active.
+
 The view scrolls past the image, so an edge can sit in the middle of the window.
 
 On a layer, paint forces those pixels on and erase forces them off. The
