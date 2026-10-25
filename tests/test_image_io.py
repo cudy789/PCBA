@@ -43,6 +43,32 @@ def test_dominant_colors_finds_copper(fixture_rgba):
     )
 
 
+def test_dominant_colors_match_bin_means():
+    """Each swatch is the rounded mean of the opaque pixels in that quantized bin."""
+    rng = np.random.default_rng(2)
+    img = rng.integers(0, 256, size=(40, 50, 4), dtype=np.uint8)
+    img[:5, :, 3] = 0
+    quantize = 8
+    colors = dominant_colors(img, count=6, quantize=quantize)
+    flat = img.reshape(-1, 4)
+    opaque = flat[flat[:, 3] > 0][:, :3]
+    bins = (256 + quantize - 1) // quantize
+    quantized = (opaque.astype(np.uint16) // quantize).astype(np.int32)
+    keys = (quantized[:, 0] * bins + quantized[:, 1]) * bins + quantized[:, 2]
+    _unique, inverse, counts = np.unique(keys, return_inverse=True, return_counts=True)
+    sums = np.column_stack(
+        [
+            np.bincount(inverse, weights=opaque[:, channel].astype(np.float64), minlength=len(counts))
+            for channel in range(3)
+        ]
+    )
+    order = np.argsort(-counts, kind="stable")[:6]
+    for (rgb, count), idx in zip(colors, order):
+        mean = np.round(sums[idx] / counts[idx]).astype(int)
+        assert rgb == (int(mean[0]), int(mean[1]), int(mean[2]))
+        assert count == int(counts[idx])
+
+
 def test_dominant_colors_empty_for_fully_transparent():
     img = np.zeros((10, 10, 4), dtype=np.uint8)
     assert dominant_colors(img) == []

@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 
 from .flatten import even_cutoffs, flatten_image
-from .masking import color_distance
+from .masking import pixels_within_tolerance
 
 
 def detect_background_color(rgba: np.ndarray) -> tuple[int, int, int] | None:
@@ -33,8 +33,8 @@ def background_mask(rgba: np.ndarray, tolerance: int = 12) -> np.ndarray:
     color = detect_background_color(rgba)
     if color is None:
         return np.zeros(rgba.shape[:2], dtype=bool)
-    # Same scale as layer masks: redmean distance halved ~ per-channel tolerance.
-    similar = (color_distance(rgba, color) / 2.0) <= float(tolerance)
+    # Same scale as layer masks: halved redmean distance ~ per-channel tolerance.
+    similar = pixels_within_tolerance(rgba, color, tolerance)
     candidate = similar | (rgba[..., 3] == 0)
     # 4-connectivity so the background cannot leak through diagonal gaps in the art.
     _, labels = cv2.connectedComponents(candidate.astype(np.uint8), connectivity=4)

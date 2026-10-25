@@ -10,7 +10,7 @@ from png_to_gerber.gui.main_window import MainWindow
 from png_to_gerber.model import BoardSettings, LayerType
 from png_to_gerber.paint import Tool
 
-from conftest import COPPER_COLOR
+from conftest import BOARD_COLOR, COPPER_COLOR, SILK_COLOR
 
 
 @pytest.fixture
@@ -299,6 +299,76 @@ def test_open_project_clears_history(window, tmp_path):
     assert len(window.project.layers) == 1
     assert not window.undo_action.isEnabled()
     assert not window.redo_action.isEnabled()
+
+
+def test_undo_of_a_stroke_keeps_masks_that_do_not_depend_on_it(window):
+    copper = window.add_layer(LayerType.COPPER)
+    window.inspector.apply_color(COPPER_COLOR)
+    silk = window.add_layer(LayerType.SILKSCREEN)
+    window.inspector.apply_color(SILK_COLOR)
+    cut = window.add_layer(LayerType.CUT)
+    window.inspector.apply_color(BOARD_COLOR)
+    negative = window.generate_negative([copper.id], LayerType.MASK)
+    window.flush_recompute()
+    window.layer_pane.select_layer(copper.id)
+
+    silk_mask = window.masks[silk.id]
+    cut_outline = window.outlines[cut.id]
+    copper_before = window.masks[copper.id].copy()
+    negative_before = window.masks[negative.id].copy()
+
+    window.set_brush_size(1)
+    window.paint_stroke([(20, 20)])
+    assert window.masks[silk.id] is silk_mask
+    assert window.outlines[cut.id] is cut_outline
+    assert not np.array_equal(window.masks[copper.id], copper_before)
+    assert not np.array_equal(window.masks[negative.id], negative_before)
+    copper_painted = window.masks[copper.id].copy()
+    negative_painted = window.masks[negative.id].copy()
+
+    window.undo()
+    assert window.masks[silk.id] is silk_mask
+    assert window.outlines[cut.id] is cut_outline
+    assert np.array_equal(window.masks[copper.id], copper_before)
+    assert np.array_equal(window.masks[negative.id], negative_before)
+
+    window.redo()
+    assert window.masks[silk.id] is silk_mask
+    assert window.outlines[cut.id] is cut_outline
+    assert np.array_equal(window.masks[copper.id], copper_painted)
+    assert np.array_equal(window.masks[negative.id], negative_painted)
+
+
+def test_undo_visibility_shows_the_overlay_without_rebuilding_its_mask(window):
+    silk = window.add_layer(LayerType.SILKSCREEN)
+    window.inspector.apply_color(SILK_COLOR)
+    window.flush_recompute()
+    mask = window.masks[silk.id]
+    window.set_layer_visible(silk.id, False)
+    assert not window.canvas.overlay_items[silk.id].isVisible()
+
+    window.undo()
+    assert window.project.layers[0].visible
+    assert window.canvas.overlay_items[silk.id].isVisible()
+    assert window.masks[silk.id] is mask
+
+
+def test_undo_base_paint_rebuilds_layer_masks(window):
+    layer = window.add_layer(LayerType.COPPER)
+    window.inspector.apply_color(COPPER_COLOR)
+    window.flush_recompute()
+    before = window.masks[layer.id].copy()
+    window.layer_pane.select_base()
+    window.set_paint_color(COPPER_COLOR)
+    window.set_brush_size(1)
+    window.paint_stroke([(29, 40)])  # beside the copper block, so it is not a speck
+    window.flush_recompute()
+    assert window.masks[layer.id][40, 29] == 255
+    assert not np.array_equal(window.masks[layer.id], before)
+
+    window.undo()
+    assert window.masks[layer.id][40, 29] == 0
+    assert np.array_equal(window.masks[layer.id], before)
 
 
 def test_key_repeat_on_a_slider_is_one_step(window):

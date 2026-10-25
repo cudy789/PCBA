@@ -49,22 +49,31 @@ def dominant_colors(
     Returns [(mean_rgb, pixel_count), ...] sorted by descending count.
     Fully transparent pixels are ignored.
     """
-    flat = rgba.reshape(-1, 4)
-    opaque = flat[flat[:, 3] > 0][:, :3]
-    if opaque.size == 0:
+    opaque = rgba[..., 3] > 0
+    if not np.any(opaque):
         return []
+    quantize = max(1, int(quantize))
     bins = (256 + quantize - 1) // quantize
-    quantized = (opaque.astype(np.uint16) // quantize).astype(np.int32)
-    keys = (quantized[:, 0] * bins + quantized[:, 1]) * bins + quantized[:, 2]
-    _unique, inverse, counts = np.unique(keys, return_inverse=True, return_counts=True)
-    order = np.argsort(counts)[::-1][:count]
-    weights = opaque.astype(np.float64)
-    sums = np.column_stack(
-        [
-            np.bincount(inverse, weights=weights[:, channel], minlength=len(counts))
-            for channel in range(3)
-        ]
-    )
+    # Histogram the quantized bins in one pass per channel. Sorting every opaque
+    # pixel dominates once the image is a few megapixels.
+    quantized = rgba[..., :3].astype(np.uint16) // np.uint16(quantize)
+    keys = (
+        quantized[..., 0].astype(np.int32) * bins + quantized[..., 1].astype(np.int32)
+    ) * bins + quantized[..., 2].astype(np.int32)
+    n_bins = bins * bins * bins
+    flat_keys = np.ascontiguousarray(keys).ravel()
+    weight = np.ascontiguousarray(opaque).ravel().astype(np.float64)
+    counts = np.bincount(flat_keys, weights=weight, minlength=n_bins)
+    sums = np.empty((n_bins, 3), dtype=np.float64)
+    channel = np.empty(flat_keys.shape[0], dtype=np.float64)
+    for index in range(3):
+        channel[:] = np.ascontiguousarray(rgba[..., index]).ravel()
+        channel *= weight
+        sums[:, index] = np.bincount(flat_keys, weights=channel, minlength=n_bins)
+    order = np.argsort(-counts, kind="stable")
+    order = order[counts[order] > 0][:count]
+    if order.size == 0:
+        return []
     means = np.round(sums[order] / counts[order, None]).astype(int)
     return [
         ((int(mean[0]), int(mean[1]), int(mean[2])), int(counts[idx]))

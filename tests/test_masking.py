@@ -128,6 +128,27 @@ def test_fill_holes_option(fixture_rgba):
     assert filled[60, 60] == 255
 
 
+def test_build_mask_matches_perceptual_distance():
+    """Squared-distance matching agrees with the redmean formula, alpha included."""
+    rng = np.random.default_rng(0)
+    img = rng.integers(0, 256, size=(24, 30, 4), dtype=np.uint8)
+    color = (20, 80, 200)
+    dist = color_distance(img, color) / 2.0
+    alpha = img[..., 3].astype(np.float32)
+    weighted = np.hypot(dist, (255.0 - alpha) * 0.25)
+    for tolerance in (0, 12, 35, 80, 150):
+        opaque = build_mask(
+            img, color, tolerance=tolerance, close_radius=0, min_island=0
+        )
+        expected = (weighted <= tolerance) & (img[..., 3] > 0)
+        assert np.array_equal(opaque > 0, expected)
+        raw = build_mask(
+            img, color, tolerance=tolerance, close_radius=0, min_island=0,
+            include_transparent=True,
+        )
+        assert np.array_equal(raw > 0, dist <= tolerance)
+
+
 def test_fill_enclosed_holes_keeps_open_regions_open():
     mask = np.zeros((20, 20), dtype=np.uint8)
     mask[2:18, 2:18] = 255
@@ -136,6 +157,18 @@ def test_fill_enclosed_holes_keeps_open_regions_open():
     filled = fill_enclosed_holes(mask)
     assert filled[7, 7] == 255  # hole filled
     assert filled[0, 10] == 0  # border background untouched
+
+
+def test_fill_enclosed_holes_when_corner_is_foreground():
+    """One flood from the padded border still finds a hole when (0, 0) is set."""
+    mask = np.full((20, 20), 255, dtype=np.uint8)
+    mask[5:10, 5:10] = 0
+    mask[0, 8:12] = 0  # opening on the top edge, away from the corner
+    filled = fill_enclosed_holes(mask)
+    assert filled[7, 7] == 255
+    assert filled[0, 10] == 0
+    assert filled[0, 0] == 255
+    assert filled[19, 19] == 255
 
 
 def test_empty_mask_when_no_color_matches(fixture_rgba):

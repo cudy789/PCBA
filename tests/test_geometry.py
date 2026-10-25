@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+import shapely
 from shapely.geometry import Polygon
 
 from png_to_gerber.geometry import CutError, cut_outline, iter_polygons, mask_to_geometry
@@ -35,6 +36,18 @@ def test_mask_to_geometry_retains_holes(fixture_rgba):
     polys = list(iter_polygons(geom))
     assert len(polys) == 1
     assert len(polys[0].interiors) == 1  # the board-colored hole
+
+
+def test_mask_to_geometry_random_mask_is_pixel_exact():
+    """Detailed masks keep every set pixel, including corner pinches and holes."""
+    rng = np.random.default_rng(1)
+    mask = (rng.random((80, 90)) > 0.45).astype(np.uint8) * 255
+    geom = mask_to_geometry(mask)
+    assert geom.is_valid
+    assert geom.area == int((mask > 0).sum())
+    ys, xs = np.mgrid[0:80:2, 0:90:2]
+    inside = shapely.contains_xy(geom, xs + 0.5, ys + 0.5)
+    assert np.array_equal(inside, mask[0:80:2, 0:90:2] > 0)
 
 
 def test_mask_to_geometry_multiple_regions():

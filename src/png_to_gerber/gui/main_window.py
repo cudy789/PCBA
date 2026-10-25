@@ -102,6 +102,7 @@ class MainWindow(QMainWindow):
         self._originals: dict[int, np.ndarray] = {}  # image id -> file pixels
         self._working: dict[int, np.ndarray] = {}  # image id -> pixels layers mask
         self._palettes: dict[int, list] = {}  # image id -> dominant colors of its working image
+        self._preview_cache: dict[int, tuple] = {}  # image id -> flatten histogram inputs
         self._comparing: set[int] = set()  # image ids showing the pre-flatten canvas
         self.masks: dict[int, np.ndarray] = {}
         self.outlines: dict[int, object] = {}  # layer id -> shapely Polygon
@@ -473,28 +474,145 @@ class MainWindow(QMainWindow):
         self._restore(state)
         self.statusBar().showMessage("Redone.")
 
+    def _image_pixels_key(self, image) -> tuple:
+        """Inputs of the composed working image. Equal keys mean the same pixels."""
+        original = self._originals.get(image.id)
+        if image.flatten_enabled:
+            flatten = self._flatten_signature(image)
+        else:
+            flatten = (False,)
+        return (
+            None if original is None else id(original),
+            bool(image.background_removed),
+            int(image.background_tolerance) if image.background_removed else 0,
+            flatten,
+            tuple(tuple(int(value) for value in entry) for entry in image.paint),
+        )
+
+    def _layer_mask_key(self, layer: Layer) -> tuple:
+        """Inputs of one layer mask. Equal keys mean the cached mask is still valid."""
+        parent = self.project.image_of(layer.id)
+        working = None if parent is None else self._working.get(parent.id)
+        source_working = []
+        for source_id in layer.negative_of:
+            owner = self.project.image_of(source_id)
+            if owner is not None and owner.id in self._working:
+                source_working.append(id(self._working[owner.id]))
+        return (
+            None if parent is None else parent.id,
+            None if working is None else id(working),
+            self._canvas_shape(),
+            layer.layer_type.value,
+            bool(layer.has_color),
+            tuple(int(channel) for channel in layer.color),
+            int(layer.tolerance),
+            int(layer.close_radius),
+            int(layer.min_island),
+            bool(layer.fill_holes),
+            bool(layer.inverted),
+            int(layer.smoothness),
+            layer.outline_mode.value,
+            tuple(int(source_id) for source_id in layer.negative_of),
+            tuple(source_working),
+            tuple(tuple(int(value) for value in run) for run in layer.manual),
+        )
+
     def _restore(self, state) -> None:
         self._restoring = True
         try:
+            # A brush stroke changes one layer's runs. Rebuilding every base
+            # image and every mask made undo much slower than drawing the stroke.
+            self._recompute_timer.stop()
+            self._dirty_layers.clear()
             self._stroke = None
             self.canvas.cancel_rectangle()
+            previous_pixels = {
+                image.id: self._image_pixels_key(image) for image in self.project.images
+            }
+            previous_masks = {
+                layer.id: self._layer_mask_key(layer) for layer in self.project.layers
+            }
+            previous_visible = {layer.id: layer.visible for layer in self.project.layers}
+            previous_ids = [image.id for image in self.project.images]
+            previous_canvas = self._canvas_shape()
+            kept_working = dict(self._working)
+
             self.project = clone_project(state.project)
             self._originals = dict(state.originals)
-            self._working.clear()
-            self._palettes.clear()
-            self.masks.clear()
-            self.outlines.clear()
-            self._dirty_layers.clear()
-            alive = {image.id for image in self.project.images}
-            self._comparing &= alive
+            alive_images = {image.id for image in self.project.images}
+            self._comparing &= alive_images
+
+            new_pixels: dict[int, tuple] = {}
+            rebuilt: dict[int, np.ndarray] = {}
             for image in self.project.images:
-                if image.id in self._originals:
-                    self._working[image.id] = self._compose_working(image)
+                if image.id not in self._originals:
+                    continue
+                key = self._image_pixels_key(image)
+                new_pixels[image.id] = key
+                cached = kept_working.get(image.id)
+                if cached is not None and key == previous_pixels.get(image.id):
+                    rebuilt[image.id] = cached
+                else:
+                    rebuilt[image.id] = self._compose_working(image)
+                    self._palettes.pop(image.id, None)
+            self._working = rebuilt
+            for image_id in list(self._palettes):
+                if image_id not in self._working:
+                    self._palettes.pop(image_id, None)
+            for image_id in list(self._preview_cache):
+                if image_id not in self._working:
+                    self._preview_cache.pop(image_id, None)
+
+            alive_layers = {layer.id for layer in self.project.layers}
+            for layer_id in list(self.masks):
+                if layer_id not in alive_layers:
+                    self.masks.pop(layer_id, None)
+                    self.outlines.pop(layer_id, None)
+                    self.canvas.remove_layer_items(layer_id)
+            for layer_id in list(self.outlines):
+                if layer_id not in alive_layers:
+                    self.outlines.pop(layer_id, None)
+                    self.canvas.remove_layer_items(layer_id)
+
+            dirty: set[int] = set()
+            for layer in self.project.layers:
+                changed = self._layer_mask_key(layer) != previous_masks.get(layer.id)
+                missing = layer.has_artwork and layer.id not in self.masks
+                if changed or missing:
+                    dirty.add(layer.id)
+            canvas_match = (
+                [image.id for image in self.project.images] == previous_ids
+                and self._canvas_shape() == previous_canvas
+            )
             self.checker_slider.blockSignals(True)
             self.checker_slider.setValue(self.project.checker_opacity)
             self.checker_slider.blockSignals(False)
             self.canvas.set_checker_opacity(self.project.checker_opacity)
-            self._refresh_canvas(fit=False)
+            if canvas_match:
+                for image in self.project.images:
+                    if image.id not in self._working:
+                        continue
+                    if new_pixels.get(image.id) != previous_pixels.get(image.id):
+                        self.canvas.set_base_pixels(image.id, self._pixels_for_canvas(image))
+                    self.canvas.set_base_visible(self._base_shown(image), image.id)
+                for layer in self.project.layers:
+                    if layer.id in dirty:
+                        continue
+                    if previous_visible.get(layer.id) != layer.visible:
+                        self.canvas.set_layer_visible(layer.id, layer.visible)
+            else:
+                # The scene is cleared, so every surviving mask has to be drawn again.
+                self._refresh_canvas(fit=False, mark_dirty=False, sync_base=False)
+                for layer in self.project.layers:
+                    if layer.has_artwork or layer.id in self.masks:
+                        dirty.add(layer.id)
+            for layer_id in list(dirty):
+                dirty |= self.project.dependents(layer_id)
+            for layer_id in self.project.dependency_order(dirty):
+                layer = self.project.get_layer(layer_id)
+                if layer is not None:
+                    self.recompute_layer(layer)
+            self._sync_base_controls()
             if state.selected_layer is not None and self.project.get_layer(state.selected_layer):
                 self._refresh_layers(selected_id=state.selected_layer)
             elif state.selected_image is not None and self.project.get_image(state.selected_image):
@@ -503,7 +621,6 @@ class MainWindow(QMainWindow):
                 self._refresh_layers()
                 if self.project.images:
                     self.layer_pane.select_base(self.project.images[0].id)
-            self.flush_recompute()
             self._sync_modified()
             self._update_undo_actions()
         finally:
@@ -705,7 +822,7 @@ class MainWindow(QMainWindow):
             if existed:
                 self._mark_modified()
 
-    def _refresh_canvas(self, fit: bool) -> None:
+    def _refresh_canvas(self, fit: bool, *, mark_dirty: bool = True, sync_base: bool = True) -> None:
         """Redraw every base image on the shared top-left canvas."""
         pairs = [
             (image.id, self._pixels_for_canvas(image))
@@ -716,8 +833,10 @@ class MainWindow(QMainWindow):
         for image in self.project.images:
             self.canvas.set_base_visible(self._base_shown(image), image.id)
         self._sync_locked_board_height()
-        self._sync_base_controls()
-        self._mark_dirty(*[layer.id for layer in self.project.layers])
+        if sync_base:
+            self._sync_base_controls()
+        if mark_dirty:
+            self._mark_dirty(*[layer.id for layer in self.project.layers])
 
     def _refresh_layers(self, selected_id: int | None = None, selected_image_id: int | None = None) -> None:
         self.layer_pane.refresh(
@@ -819,11 +938,28 @@ class MainWindow(QMainWindow):
         cutoffs = [int(value) for value in image.flatten_cutoffs]
         if len(cutoffs) != count - 1:
             cutoffs = even_cutoffs(count)
+        original = self._originals.get(image.id)
+        key = (
+            None if original is None else id(original),
+            bool(image.background_removed),
+            int(image.background_tolerance) if image.background_removed else 0,
+            tuple(cutoffs),
+            tuple(
+                None if color is None else tuple(int(channel) for channel in color)
+                for color in image.flatten_colors
+            ),
+        )
+        cached = self._preview_cache.get(image.id)
+        if cached is not None and cached[0] == key:
+            return cached[1]
         prepared = self._prepared_image(image)
         if prepared is None:
             grays = [(30 + index * 18, 30 + index * 18, 30 + index * 18) for index in range(count)]
-            return cutoffs, grays, np.zeros(256, dtype=np.int64)
-        return cutoffs, palette_for(prepared, cutoffs, image.flatten_colors), histogram(prepared)
+            result = cutoffs, grays, np.zeros(256, dtype=np.int64)
+        else:
+            result = cutoffs, palette_for(prepared, cutoffs, image.flatten_colors), histogram(prepared)
+        self._preview_cache[image.id] = (key, result)
+        return result
 
     def set_flatten(
         self,
@@ -1714,6 +1850,7 @@ class MainWindow(QMainWindow):
             self._originals.clear()
             self._working.clear()
             self._palettes.clear()
+            self._preview_cache.clear()
             self._comparing.clear()
             self.checker_slider.blockSignals(True)
             self.checker_slider.setValue(self.project.checker_opacity)
@@ -1769,6 +1906,7 @@ class MainWindow(QMainWindow):
             self._originals.clear()
             self._working.clear()
             self._palettes.clear()
+            self._preview_cache.clear()
             self._comparing.clear()
             for image, original, candidate in loaded:
                 image.path = str(candidate)

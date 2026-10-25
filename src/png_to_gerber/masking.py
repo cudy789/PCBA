@@ -13,24 +13,51 @@ import cv2
 import numpy as np
 
 
-def color_distance(rgba: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
-    """Perceptual (redmean) distance from every pixel to `color`, as float32.
-
-    Result scale is comparable to a 0-255 per-channel difference; the maximum
-    possible value (black vs white) is around 765.
-    """
+def _redmean_dist2(rgba: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
+    """Squared redmean distance from every pixel to `color`."""
     rgb = rgba[..., :3].astype(np.float32)
     cr, cg, cb = (float(c) for c in color)
     dr = rgb[..., 0] - cr
     dg = rgb[..., 1] - cg
     db = rgb[..., 2] - cb
     rmean = (rgb[..., 0] + cr) / 2.0
-    dist2 = (
+    return (
         (2.0 + rmean / 256.0) * dr * dr
         + 4.0 * dg * dg
         + (2.0 + (255.0 - rmean) / 256.0) * db * db
     )
-    return np.sqrt(dist2)
+
+
+def color_distance(rgba: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
+    """Perceptual (redmean) distance from every pixel to `color`, as float32.
+
+    Result scale is comparable to a 0-255 per-channel difference; the maximum
+    possible value (black vs white) is around 765.
+    """
+    return np.sqrt(_redmean_dist2(rgba, color))
+
+
+def pixels_within_tolerance(
+    rgba: np.ndarray,
+    color: tuple[int, int, int],
+    tolerance: float,
+    *,
+    weigh_alpha: bool = False,
+) -> np.ndarray:
+    """Pixels whose redmean distance, halved, is within `tolerance`.
+
+    Comparing squared distances skips the square root. With `weigh_alpha`, a
+    shortfall from opaque is added on that same scale: an exact-color pixel at
+    alpha 128 is 31.75 away and one at alpha 32 is 55.75 away.
+    """
+    if tolerance < 0 or rgba.size == 0:
+        return np.zeros(rgba.shape[:2], dtype=bool)
+    dist2 = _redmean_dist2(rgba, color)
+    limit = (2.0 * float(tolerance)) ** 2
+    if not weigh_alpha:
+        return dist2 <= limit
+    gap = 255.0 - rgba[..., 3].astype(np.float32)
+    return dist2 + 0.25 * gap * gap <= limit
 
 
 def build_mask(
@@ -57,14 +84,14 @@ def build_mask(
       premultiplied edges of other colors), and an RGB-only test would
       select that whole fringe for a black layer.
     """
-    dist = color_distance(rgba, color) / 2.0
-    if not include_transparent:
-        # Quartered so the gap sits on the tolerance scale: an exact-color
-        # pixel at alpha 128 is 31.75 away (inside the default tolerance of
-        # 35) and one at alpha 32 is 55.75 away (outside it).
-        alpha = rgba[..., 3].astype(np.float32)
-        dist = np.hypot(dist, (255.0 - alpha) * 0.25)
-    mask = (dist <= float(tolerance)).astype(np.uint8) * 255
+    # Quartered alpha gap, when used, sits on the tolerance scale: an
+    # exact-color pixel at alpha 128 is 31.75 away (inside the default
+    # tolerance of 35) and one at alpha 32 is 55.75 away (outside it).
+    matched = pixels_within_tolerance(
+        rgba, color, tolerance, weigh_alpha=not include_transparent
+    )
+    mask = matched.astype(np.uint8)
+    mask *= 255
 
     if not include_transparent:
         mask[rgba[..., 3] == 0] = 0
@@ -87,9 +114,11 @@ def remove_small_islands(mask: np.ndarray, min_island: int) -> np.ndarray:
     if min_island <= 0 or mask.max() == 0:
         return mask
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-    keep = np.zeros(n, dtype=bool)
-    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= min_island
-    return np.where(keep[labels], 255, 0).astype(np.uint8)
+    lut = np.zeros(n, dtype=np.uint8)
+    big = stats[:, cv2.CC_STAT_AREA] >= min_island
+    big[0] = False  # label 0 is the background
+    lut[big] = 255
+    return lut[labels]
 
 
 def invert_mask(rgba: np.ndarray, mask: np.ndarray, min_island: int = 0) -> np.ndarray:
@@ -118,22 +147,18 @@ def negative_mask(
 
 
 def fill_enclosed_holes(mask: np.ndarray) -> np.ndarray:
-    """Fill regions of background that are fully enclosed by the mask."""
-    h, w = mask.shape
-    # Flood-fill the background from the border; anything still 0 is a hole.
-    flood = np.zeros((h + 2, w + 2), dtype=np.uint8)
-    inverted = cv2.bitwise_not(mask)
-    cv2.floodFill(inverted, flood, (0, 0), 0)
-    # Also flood from all border pixels in case (0,0) is inside the mask.
-    border = np.zeros_like(mask)
-    border[0, :] = border[-1, :] = 255
-    border[:, 0] = border[:, -1] = 255
-    seeds = cv2.bitwise_and(cv2.bitwise_not(mask), border)
-    ys, xs = np.nonzero(seeds)
-    inverted = cv2.bitwise_not(mask)
-    flood = np.zeros((h + 2, w + 2), dtype=np.uint8)
-    for y, x in zip(ys.tolist(), xs.tolist()):
-        if inverted[y, x]:
-            cv2.floodFill(inverted, flood, (x, y), 0)
-    holes = inverted  # leftover non-zero = enclosed holes
-    return cv2.bitwise_or(mask, holes)
+    """Fill regions of background that are fully enclosed by the mask.
+
+    A one-pixel frame of background makes the outside a single 4-connected
+    region, so one flood fill reaches every border opening. Zeros the flood
+    never reaches are holes.
+    """
+    height, width = mask.shape
+    padded = np.zeros((height + 2, width + 2), dtype=np.uint8)
+    padded[1:-1, 1:-1] = np.where(mask > 0, np.uint8(255), np.uint8(0))
+    # floodFill's mask argument is two pixels larger than the image.
+    cv2.floodFill(padded, np.zeros((height + 4, width + 4), dtype=np.uint8), (0, 0), 128)
+    holes = padded[1:-1, 1:-1] == 0
+    result = np.array(mask, copy=True)
+    result[holes] = 255
+    return result
