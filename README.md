@@ -125,9 +125,28 @@ flattening so you can judge the cutoffs; layer masks keep using the flattened
 image. Untick *Flatten colors* to restore the source colors. Each image
 remembers its own settings.
 
-The toolbar holds the **Checker opacity** slider (how strong the transparency
+The top toolbar holds the **Checker opacity** slider (how strong the transparency
 grid is; it starts at 50%). Open, save, and export live in the File menu.
 Show or hide the base image from the View menu.
+
+## Paint
+
+The left toolbar paints pixels by hand. Select a layer to edit that layer's
+mask, or select the base image to edit its pixels. The tools are a
+**paintbrush**, a **straight line**, a **rectangle** (click one corner, then
+the opposite corner; only the outline is drawn), an **eraser**, and a **fill**
+bucket. One **Brush Size** slider, or a typed number, sets the diameter for every tool except fill. Click the active tool
+again to pan with the left button; middle-drag pans while a tool is active.
+
+On a layer, paint forces those pixels on and erase forces them off. The
+strokes stay when you change tolerance, gap closing, or invert, and they are
+enough on their own — a layer does not need a matched color before you can
+paint it. Fill clicks an empty area and fills the connected empty region.
+On the base image, the color button chooses the painted color (including
+transparency). Erase makes pixels transparent. Fill replaces the connected
+pixels of the exact same color. Painted base pixels are applied after
+background removal and color flattening, so the color you pick is the color
+the layers see.
 
 ## Project files (.prj)
 
@@ -136,7 +155,9 @@ Show or hide the base image from the View menu.
 
 - every layer, nested under its base image: name, type, side, color,
   tolerance, gap closing, min island, fill holes, cut smoothness/perimeter,
-  visibility, invert, and negative sources
+  visibility, invert, negative sources, and hand-painted mask pixels
+- per image, any pixels painted onto the base image (coordinates are in the
+  source image, so they survive background removal and flattening)
 - layer order, board width/height, aspect lock, output folder, and base name
   (set via *File > Board settings* or the export dialog)
 - per image: background-removal state and tolerance, color flattening

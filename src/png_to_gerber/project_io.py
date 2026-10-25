@@ -50,7 +50,7 @@ class ProjectFileError(ValueError):
 
 
 def _layer_to_dict(layer: Layer, index_of: dict[int, int]) -> dict[str, Any]:
-    return {
+    stored = {
         "name": layer.name,
         "type": layer.layer_type.value,
         "side": layer.side.value,
@@ -66,6 +66,9 @@ def _layer_to_dict(layer: Layer, index_of: dict[int, int]) -> dict[str, Any]:
         "inverted": layer.inverted,
         "negative_of": [index_of[s] for s in layer.negative_of if s in index_of],
     }
+    if layer.manual:
+        stored["manual"] = [list(run) for run in layer.manual]
+    return stored
 
 
 def _path_dict(path: str | None, project_dir: Path | None) -> dict[str, Any]:
@@ -122,7 +125,7 @@ def project_to_dict(project: Project, project_dir: Path | None = None) -> dict[s
     board = _board_dict(project.board)
     if len(project.images) <= 1:
         image = project.images[0] if project.images else None
-        return {
+        stored = {
             "format": FORMAT,
             "version": 1,
             "image": _path_dict(image.path if image else None, project_dir),
@@ -138,6 +141,9 @@ def project_to_dict(project: Project, project_dir: Path | None = None) -> dict[s
             },
             "layers": [_layer_to_dict(layer, index_of) for layer in project.layers],
         }
+        if image is not None and image.paint:
+            stored["paint"] = [list(pixel) for pixel in image.paint]
+        return stored
 
     images = []
     for image in project.images:
@@ -150,6 +156,8 @@ def project_to_dict(project: Project, project_dir: Path | None = None) -> dict[s
         stored["flatten"] = _flatten_dict(image)
         stored["visible"] = image.visible
         stored["layers"] = [_layer_to_dict(layer, index_of) for layer in image.layers]
+        if image.paint:
+            stored["paint"] = [list(pixel) for pixel in image.paint]
         images.append(stored)
     return {
         "format": FORMAT,
@@ -209,6 +217,48 @@ def _get_optional_float(data: dict, key: str, where: str) -> float | None:
     return float(value)
 
 
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _parse_manual(data: dict, where: str) -> list[tuple[int, int, int, int]]:
+    """Paint/erase runs. Missing means the layer has no hand-drawn pixels."""
+    if "manual" not in data or data.get("manual") is None:
+        return []
+    raw = data["manual"]
+    if not isinstance(raw, list):
+        raise ProjectFileError(f"{where}: 'manual' must be a list.")
+    runs: list[tuple[int, int, int, int]] = []
+    for entry in raw:
+        if not isinstance(entry, list) or len(entry) != 4 or any(not _is_int(part) for part in entry):
+            raise ProjectFileError(f"{where}: 'manual' entries must be [x, y, width, value].")
+        x, y, width, value = entry
+        if width < 1 or value not in (1, -1):
+            raise ProjectFileError(
+                f"{where}: 'manual' runs need a positive width and a value of 1 or -1."
+            )
+        runs.append((x, y, width, value))
+    return runs
+
+
+def _parse_paint(source: dict, where: str) -> list[tuple[int, int, int, int, int, int]]:
+    """Base-image paint pixels. Missing means the image was not painted."""
+    if "paint" not in source or source.get("paint") is None:
+        return []
+    raw = source["paint"]
+    if not isinstance(raw, list):
+        raise ProjectFileError(f"{where}: 'paint' must be a list.")
+    pixels: list[tuple[int, int, int, int, int, int]] = []
+    for entry in raw:
+        if not isinstance(entry, list) or len(entry) != 6 or any(not _is_int(part) for part in entry):
+            raise ProjectFileError(f"{where}: 'paint' entries must be [x, y, r, g, b, a].")
+        x, y, r, g, b, a = entry
+        if any(not 0 <= channel <= 255 for channel in (r, g, b, a)):
+            raise ProjectFileError(f"{where}: paint colors must be integers from 0 to 255.")
+        pixels.append((x, y, r, g, b, a))
+    return pixels
+
+
 def _parse_layer(data: Any, index: int, count: int) -> tuple[Layer, list[int]]:
     where = f"layers[{index}]"
     if not isinstance(data, dict):
@@ -254,6 +304,7 @@ def _parse_layer(data: Any, index: int, count: int) -> tuple[Layer, list[int]]:
         visible=_get_bool(data, "visible", True, where),
         has_color=_get_bool(data, "has_color", bool(sources), where) or bool(sources),
         inverted=_get_bool(data, "inverted", False, where),
+        manual=_parse_manual(data, where),
     )
     return layer, sources
 
@@ -435,6 +486,7 @@ def _project_from_v1(data: dict, project_dir: Path | None) -> Project:
             visible=_get_bool(view, "base_visible", True, "view"),
         )
         _apply_flatten(image, data, "flatten")
+        image.paint = _parse_paint(data, "paint")
         project.images.append(image)
         _attach_layers(project, [(image, parsed)])
     return project
@@ -493,6 +545,7 @@ def _project_from_v2(data: dict, project_dir: Path | None) -> Project:
             visible=_get_bool(raw, "visible", True, "images"),
         )
         _apply_flatten(image, raw, f"images[{index}].flatten")
+        image.paint = _parse_paint(raw, f"images[{image_index}]")
         project.images.append(image)
         groups.append((image, parsed[offset : offset + count]))
         offset += count

@@ -117,8 +117,8 @@ class BaseImagePanel(QWidget):
 
         self.compare_check = QCheckBox("Compare original")
         self.compare_check.setToolTip(
-            "Show this image before color flattening. Layer masks still use "
-            "the flattened colors."
+            "Show this image before color flattening, including when its eye is off. "
+            "Layer masks still use the flattened colors."
         )
         flatten_hint = QLabel(
             "Notches are the brightness boundaries. Each swatch is the color "

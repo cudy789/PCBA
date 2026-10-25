@@ -22,12 +22,13 @@ from PySide6.QtWidgets import (
     QSlider,
     QSplitter,
     QStackedWidget,
+    QToolBar,
     QVBoxLayout,
     QWidget,
 )
 
 from .. import project_io
-from ..background import crop_to_opaque, remove_background, working_image
+from ..background import crop_to_opaque, remove_background
 from ..flatten import auto_cutoffs, even_cutoffs, histogram, palette_for
 from ..gerber import BoardTransform, ExportError, export_project
 from ..geometry import CutError, cut_outline, mask_to_geometry
@@ -42,6 +43,24 @@ from ..image_export import (
 from ..image_io import canvas_size as shared_canvas_size
 from ..image_io import dominant_colors, load_rgba, pad_top_left
 from ..masking import build_mask, invert_mask, negative_mask
+from ..paint import (
+    ERASE,
+    PAINT,
+    Tool,
+    apply_edits,
+    coalesce_paint,
+    compose_painted,
+    edits_from_runs,
+    stroke_rectangle,
+    flood_fill_rgba,
+    flood_region,
+    iter_disk,
+    line_points,
+    paint_origin,
+    runs_from_edits,
+    stamp,
+    stroke as raster_stroke,
+)
 from ..model import (
     FLATTEN_COUNT_MAX,
     FLATTEN_COUNT_MIN,
@@ -62,6 +81,7 @@ from .export_dialog import ExportDialog
 from .image_export_dialog import ImageExportDialog
 from .inspector import LayerInspector
 from .layer_pane import NEGATIVE_TYPES, LayerPane
+from .paint_toolbar import PaintToolbar
 from .theme import apply_dark_theme
 
 RECOMPUTE_DEBOUNCE_MS = 120
@@ -85,6 +105,7 @@ class MainWindow(QMainWindow):
         self.outlines: dict[int, object] = {}  # layer id -> shapely Polygon
         self._dirty_layers: set[int] = set()
         self._modified = False
+        self._stroke: dict | None = None
 
         self._recompute_timer = QTimer(self)
         self._recompute_timer.setSingleShot(True)
@@ -94,7 +115,25 @@ class MainWindow(QMainWindow):
         # Widgets
         self.canvas = ImageCanvas(self)
         self.canvas.pixel_picked.connect(self._on_pixel_picked)
+        self.canvas.stroke_started.connect(self.begin_paint_stroke)
+        self.canvas.stroke_moved.connect(self.continue_paint_stroke)
+        self.canvas.stroke_finished.connect(self.end_paint_stroke)
+        self.canvas.line_committed.connect(self.paint_line)
+        self.canvas.rectangle_committed.connect(self.paint_rectangle)
+        self.canvas.fill_at.connect(self.paint_fill)
         self.setCentralWidget(self.canvas)
+
+        self.paint_toolbar = PaintToolbar(self)
+        self.paint_toolbar.tool_changed.connect(self._on_paint_tool)
+        self.paint_toolbar.brush_size_changed.connect(self.canvas.set_brush_diameter)
+        self.canvas.set_brush_diameter(self.paint_toolbar.brush_size)
+        self.paint_toolbar_host = QToolBar("Paint", self)
+        self.paint_toolbar_host.setObjectName("paint_toolbar_host")
+        self.paint_toolbar_host.setMovable(False)
+        self.paint_toolbar_host.setOrientation(Qt.Vertical)
+        self.paint_toolbar_host.setStyleSheet("QToolBar { padding: 0px; spacing: 0px; }")
+        self.paint_toolbar_host.addWidget(self.paint_toolbar)
+        self.addToolBar(Qt.LeftToolBarArea, self.paint_toolbar_host)
 
         self.layer_pane = LayerPane(self)
         self.layer_pane.add_requested.connect(self.add_layer)
@@ -208,7 +247,9 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.base_visible_action)
 
         toolbar = self.addToolBar("Main")
+        toolbar.setObjectName("main_toolbar")
         toolbar.setMovable(False)
+        self.main_toolbar = toolbar
         self.checker_label = QLabel("Checker opacity", self)
         toolbar.addWidget(self.checker_label)
         toolbar.addWidget(self.checker_slider)
@@ -361,6 +402,9 @@ class MainWindow(QMainWindow):
             image.name = path.name
             image.path = str(path)
             image.background_removed = False
+            image.paint = []
+            for layer in image.layers:
+                layer.manual = []
             reset_flatten(image)
             self._comparing.discard(image.id)
         self._originals[image.id] = original
@@ -417,7 +461,7 @@ class MainWindow(QMainWindow):
         ]
         self.canvas.set_bases(pairs, fit=fit)
         for image in self.project.images:
-            self.canvas.set_base_visible(image.visible, image.id)
+            self.canvas.set_base_visible(self._base_shown(image), image.id)
         self._sync_locked_board_height()
         self._sync_base_controls()
         self._mark_dirty(*[layer.id for layer in self.project.layers])
@@ -445,10 +489,11 @@ class MainWindow(QMainWindow):
 
     def _compose_working(self, image) -> np.ndarray:
         original = self._originals[image.id]
-        return working_image(
+        return compose_painted(
             original,
-            image.background_removed,
-            image.background_tolerance,
+            image.paint,
+            removed=image.background_removed,
+            tolerance=image.background_tolerance,
             flatten=image.flatten_enabled,
             cutoffs=image.flatten_cutoffs,
             colors=image.flatten_colors,
@@ -468,15 +513,22 @@ class MainWindow(QMainWindow):
     def _pixels_for_canvas(self, image) -> np.ndarray:
         """What the canvas draws for one image.
 
-        Compare-original shows the post-background image while layers keep
-        masking the flattened working image.
+        Compare-original shows the image after background removal and paint,
+        and before color flattening. Paint can change the crop, so this is
+        built the same way as the working image with flattening left off.
+        Layer masks keep using the flattened working image.
         """
-        working = self._working[image.id]
         if image.id in self._comparing and image.flatten_enabled:
-            prepared = self._prepared_image(image)
-            if prepared is not None and prepared.shape[:2] == working.shape[:2]:
-                return prepared
-        return working
+            original = self._originals.get(image.id)
+            if original is not None:
+                return compose_painted(
+                    original,
+                    image.paint,
+                    removed=image.background_removed,
+                    tolerance=image.background_tolerance,
+                    flatten=False,
+                )
+        return self._working[image.id]
 
     def _flatten_signature(self, image):
         return (
@@ -624,6 +676,12 @@ class MainWindow(QMainWindow):
             return
         self.set_flatten(smooth=value)
 
+    def _base_shown(self, image) -> bool:
+        """The base image is drawn when its eye is on, and also while comparing."""
+        return bool(image.visible) or (
+            image.id in self._comparing and image.flatten_enabled
+        )
+
     def _on_compare_original(self, checked: bool) -> None:
         image = self.active_image()
         if image is None:
@@ -711,7 +769,7 @@ class MainWindow(QMainWindow):
         if image.visible != visible:
             image.visible = visible
             self._mark_modified()
-        self.canvas.set_base_visible(visible, image_id)
+        self.canvas.set_base_visible(self._base_shown(image), image_id)
         self.layer_pane.show_image_visibility(image_id, visible)
         if self.active_image() is image:
             self._set_checked(self.base_visible_action, visible)
@@ -794,6 +852,7 @@ class MainWindow(QMainWindow):
             has_color=source.has_color,
             negative_of=list(source.negative_of),
             inverted=source.inverted,
+            manual=[tuple(run) for run in source.manual],
         )
         owner = self.project.image_of(source.id)
         try:
@@ -804,7 +863,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Duplicate layer", str(e))
             return None
         self._refresh_layers(selected_id=copy.id)
-        if copy.has_color or copy.is_derived:
+        if copy.has_artwork:
             self._mark_dirty(copy.id)
         self._mark_modified()
         return copy
@@ -849,7 +908,9 @@ class MainWindow(QMainWindow):
                 self, "Generate negative", "Select at least one layer first."
             )
             return None
-        uncolored = [s.name for s in sources if not s.is_derived and not s.has_color]
+        uncolored = [
+            s.name for s in sources if not s.is_derived and not s.has_color and not s.manual
+        ]
         if uncolored:
             QMessageBox.warning(
                 self,
@@ -924,6 +985,7 @@ class MainWindow(QMainWindow):
         layer = self.project.get_layer(layer_id)
         self.inspector.set_layer(layer, self._source_names(layer))
         self.inspector_stack.setCurrentWidget(self.inspector)
+        self._sync_paint_controls()
         parent = self.project.image_of(layer_id) if layer is not None else None
         if parent is not None and parent.id in self._working:
             self.inspector.set_dominant_colors(self._colors_for(parent.id))
@@ -931,6 +993,7 @@ class MainWindow(QMainWindow):
     def _on_base_selected(self, image_id=None):
         self.inspector_stack.setCurrentWidget(self.base_panel)
         self._sync_base_controls()
+        self._sync_paint_controls()
 
     def _on_layer_renamed(self, layer_id: int, name: str):
         layer = self.project.get_layer(layer_id)
@@ -953,6 +1016,287 @@ class MainWindow(QMainWindow):
         r, g, b = (int(v) for v in image[y, x, :3])
         self.inspector.apply_color((r, g, b))
         self.inspector.eyedropper_button.setChecked(False)
+
+    # ---- paint tools ------------------------------------------------------------------
+
+    def _sync_paint_controls(self) -> None:
+        """The color swatch paints the base image. Layers are on/off masks."""
+        editing_base = self.selected_layer() is None and self.image is not None
+        self.paint_toolbar.set_color_enabled(editing_base)
+
+    def _on_paint_tool(self, tool: Tool) -> None:
+        self.canvas.set_tool(tool)
+        self.statusBar().showMessage(
+            {
+                Tool.PAN: "Drag to pan. Scroll to zoom. Middle-drag pans while a paint tool is active.",
+                Tool.BRUSH: "Paintbrush: drag to add pixels.",
+                Tool.LINE: "Straight line: drag from one point to another.",
+                Tool.RECTANGLE: (
+                    "Rectangle: click one corner, then the opposite corner. "
+                    "Only the outline is drawn. Esc cancels."
+                ),
+                Tool.ERASE: "Eraser: drag to remove pixels.",
+                Tool.FILL: "Fill: click an area. Brush size does not apply.",
+            }.get(tool, "")
+        )
+
+    def set_paint_tool(self, tool: Tool) -> None:
+        self.paint_toolbar.set_tool(tool)
+
+    def set_brush_size(self, size: int) -> None:
+        self.paint_toolbar.set_brush_size(size)
+
+    def set_paint_color(self, color) -> None:
+        self.paint_toolbar.set_color(color)
+
+    def _paint_target(self):
+        """The selected layer, or the selected base image when no layer is selected."""
+        layer = self.selected_layer()
+        if layer is not None:
+            return "layer", layer
+        image = self.active_image()
+        if image is not None and image.id in self._working:
+            return "image", image
+        return None
+
+    def paint_stroke(self, points, value: int | None = None) -> None:
+        """Paint or erase through `points`. The eraser tool erases; other tools paint."""
+        if not points:
+            return
+        self.begin_paint_stroke(int(points[0][0]), int(points[0][1]), value=value)
+        for x, y in points[1:]:
+            self.continue_paint_stroke(int(x), int(y))
+        self.end_paint_stroke()
+
+    def paint_line(self, x0: int, y0: int, x1: int, y1: int) -> None:
+        self.begin_paint_stroke(int(x0), int(y0), value=PAINT)
+        if self._stroke is None:
+            return
+        if (int(x0), int(y0)) != (int(x1), int(y1)):
+            self._stamp_segment((int(x0), int(y0)), (int(x1), int(y1)))
+        self.end_paint_stroke()
+
+    def paint_rectangle(self, x0: int, y0: int, x1: int, y1: int) -> None:
+        self.begin_paint_stroke(int(x0), int(y0), value=PAINT)
+        if self._stroke is None:
+            return
+        self._paint_rectangle_body(int(x0), int(y0), int(x1), int(y1))
+        self.end_paint_stroke()
+
+    def paint_fill(self, x: int, y: int) -> None:
+        target = self._paint_target()
+        if target is None:
+            self.statusBar().showMessage("Open an image before painting.")
+            return
+        kind, obj = target
+        if kind == "layer":
+            self._fill_layer(obj, int(x), int(y))
+        else:
+            self._fill_image(obj, int(x), int(y))
+
+    def begin_paint_stroke(self, x: int, y: int, value: int | None = None) -> None:
+        if value is None:
+            value = ERASE if self.paint_toolbar.tool == Tool.ERASE else PAINT
+        target = self._paint_target()
+        if target is None:
+            self._stroke = None
+            self.statusBar().showMessage("Open an image before painting.")
+            return
+        kind, obj = target
+        size = self.paint_toolbar.brush_size
+        if kind == "layer":
+            height, width = self._canvas_shape()
+            if height <= 0 or width <= 0:
+                self._stroke = None
+                return
+            mask = self.masks.get(obj.id)
+            if mask is None or mask.shape[:2] != (height, width):
+                mask = np.zeros((height, width), dtype=np.uint8)
+            else:
+                mask = np.array(mask, copy=True)
+            self._stroke = {
+                "kind": "layer",
+                "layer": obj,
+                "edits": edits_from_runs(obj.manual, (height, width)),
+                "mask": mask,
+                "value": int(value),
+                "size": size,
+                "last": (int(x), int(y)),
+            }
+        else:
+            working = self._working.get(obj.id)
+            if working is None:
+                self._stroke = None
+                return
+            color = (0, 0, 0, 0) if value == ERASE else self.paint_toolbar.color
+            self._stroke = {
+                "kind": "image",
+                "image": obj,
+                "pixels": np.array(working, copy=True),
+                "entries": [],
+                "origin": paint_origin(
+                    self._originals[obj.id],
+                    obj.paint,
+                    obj.background_removed,
+                    obj.background_tolerance,
+                ),
+                "color": color,
+                "value": int(value),
+                "size": size,
+                "last": (int(x), int(y)),
+            }
+        self._stamp_dab(int(x), int(y))
+
+    def continue_paint_stroke(self, x: int, y: int) -> None:
+        if self._stroke is None:
+            return
+        point = (int(x), int(y))
+        last = self._stroke["last"]
+        if point != last:
+            self._stamp_segment(last, point)
+            self._stroke["last"] = point
+
+    def end_paint_stroke(self) -> None:
+        stroke = self._stroke
+        self._stroke = None
+        if stroke is None:
+            return
+        if stroke["kind"] == "layer":
+            layer = stroke["layer"]
+            manual = runs_from_edits(stroke["edits"])
+            if manual == list(layer.manual):
+                return
+            layer.manual = manual
+            self._mark_modified()
+            self._recompute_layer_and_dependents(layer)
+            return
+        if not stroke["entries"]:
+            return
+        image = stroke["image"]
+        image.paint = coalesce_paint([*image.paint, *stroke["entries"]])
+        self._rebuild_working(image)
+        self.flush_recompute()
+        self._mark_modified()
+
+    def _stamp_dab(self, x: int, y: int) -> None:
+        stroke = self._stroke
+        if stroke is None:
+            return
+        if stroke["kind"] == "layer":
+            shown = 255 if stroke["value"] == PAINT else 0
+            stamp(stroke["edits"], x, y, stroke["size"], stroke["value"])
+            stamp(stroke["mask"], x, y, stroke["size"], shown)
+            layer = stroke["layer"]
+            self.canvas.set_layer_overlay(layer.id, stroke["mask"], layer.layer_type.value)
+            return
+        self._stamp_image_disk(x, y)
+        self.canvas.set_base_pixels(stroke["image"].id, stroke["pixels"])
+
+    def _stamp_segment(self, start: tuple[int, int], end: tuple[int, int]) -> None:
+        stroke = self._stroke
+        if stroke is None:
+            return
+        if stroke["kind"] == "layer":
+            shown = 255 if stroke["value"] == PAINT else 0
+            raster_stroke(
+                stroke["edits"], start[0], start[1], end[0], end[1], stroke["size"], stroke["value"]
+            )
+            raster_stroke(
+                stroke["mask"], start[0], start[1], end[0], end[1], stroke["size"], shown
+            )
+            layer = stroke["layer"]
+            self.canvas.set_layer_overlay(layer.id, stroke["mask"], layer.layer_type.value)
+            return
+        for x, y in line_points(start[0], start[1], end[0], end[1]):
+            self._stamp_image_disk(x, y)
+        self.canvas.set_base_pixels(stroke["image"].id, stroke["pixels"])
+
+    def _stamp_image_disk(self, x: int, y: int) -> None:
+        stroke = self._stroke
+        pixels = stroke["pixels"]
+        height, width = pixels.shape[:2]
+        origin_x, origin_y = stroke["origin"]
+        color = stroke["color"]
+        for px, py in iter_disk(x, y, stroke["size"], height, width):
+            stroke["entries"].append((px + origin_x, py + origin_y, *color))
+        stamp(pixels, x, y, stroke["size"], color)
+
+    def _paint_rectangle_body(self, x0: int, y0: int, x1: int, y1: int) -> None:
+        stroke = self._stroke
+        if stroke is None:
+            return
+        if stroke["kind"] == "layer":
+            stroke_rectangle(stroke["edits"], x0, y0, x1, y1, stroke["size"], PAINT)
+            stroke_rectangle(stroke["mask"], x0, y0, x1, y1, stroke["size"], 255)
+            layer = stroke["layer"]
+            self.canvas.set_layer_overlay(layer.id, stroke["mask"], layer.layer_type.value)
+            return
+        before = np.array(stroke["pixels"], copy=True)
+        stroke_rectangle(stroke["pixels"], x0, y0, x1, y1, stroke["size"], stroke["color"])
+        changed = np.any(stroke["pixels"] != before, axis=-1)
+        origin_x, origin_y = stroke["origin"]
+        color = stroke["color"]
+        ys, xs = np.nonzero(changed)
+        for x, y in zip(xs.tolist(), ys.tolist()):
+            stroke["entries"].append((x + origin_x, y + origin_y, *color))
+        self.canvas.set_base_pixels(stroke["image"].id, stroke["pixels"])
+
+    def _fill_layer(self, layer: Layer, x: int, y: int) -> None:
+        height, width = self._canvas_shape()
+        if height <= 0 or not (0 <= x < width and 0 <= y < height):
+            return
+        mask = self.masks.get(layer.id)
+        if mask is None or mask.shape[:2] != (height, width):
+            mask = np.zeros((height, width), dtype=np.uint8)
+        # Clicking an area that is already on would freeze that whole region
+        # into the manual override. Leave it to the color mask instead.
+        if mask[y, x] > 0:
+            return
+        region = flood_region(mask > 0, x, y)
+        edits = edits_from_runs(layer.manual, (height, width))
+        edits[region] = PAINT
+        layer.manual = runs_from_edits(edits)
+        self._mark_modified()
+        self._recompute_layer_and_dependents(layer)
+
+    def _fill_image(self, image, x: int, y: int) -> None:
+        working = self._working.get(image.id)
+        if working is None or not (0 <= y < working.shape[0] and 0 <= x < working.shape[1]):
+            return
+        color = self.paint_toolbar.color
+        filled = flood_fill_rgba(working, x, y, color)
+        if np.array_equal(filled, working):
+            return
+        changed = np.any(filled != working, axis=-1)
+        origin = paint_origin(
+            self._originals[image.id],
+            image.paint,
+            image.background_removed,
+            image.background_tolerance,
+        )
+        origin_x, origin_y = origin
+        entries = list(image.paint)
+        ys, xs = np.nonzero(changed)
+        for px, py in zip(xs.tolist(), ys.tolist()):
+            entries.append((px + origin_x, py + origin_y, *color))
+        image.paint = coalesce_paint(entries)
+        self._rebuild_working(image)
+        self.flush_recompute()
+        self._mark_modified()
+
+    def _recompute_layer_and_dependents(self, layer: Layer) -> None:
+        self.recompute_layer(layer)
+        for layer_id in self.project.dependency_order(self.project.dependents(layer.id)):
+            dependent = self.project.get_layer(layer_id)
+            if dependent is not None:
+                self.recompute_layer(dependent)
+
+    def keyPressEvent(self, event):
+        if self.canvas.tool == Tool.RECTANGLE and event.key() == Qt.Key_Escape:
+            self.canvas.cancel_rectangle()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     # ---- recompute engine ------------------------------------------------------------
 
@@ -1020,13 +1364,22 @@ class MainWindow(QMainWindow):
             if layer.inverted:
                 native = invert_mask(working, native, min_island=layer.min_island)
             mask = pad_top_left(native, height, width)
+        elif layer.manual:
+            mask = np.zeros((height, width), dtype=np.uint8)
         else:
+            self.masks.pop(layer.id, None)
+            self.outlines.pop(layer.id, None)
+            self.canvas.remove_layer_items(layer.id)
             return
+        # Hand-drawn pixels are applied last so they survive tolerance, gap
+        # closing, and invert. Paint forces a pixel on; erase forces it off.
+        if layer.manual:
+            mask = apply_edits(mask, edits_from_runs(layer.manual, (height, width)))
         self.masks[layer.id] = mask
         if layer.is_cut:
             try:
                 outline = cut_outline(
-                    native if native is not None else mask,
+                    mask,
                     layer.smoothness,
                     layer.outline_mode,
                 )
@@ -1256,7 +1609,7 @@ class MainWindow(QMainWindow):
 
         geometries = {}
         for layer in self.project.artwork_layers():
-            if not layer.visible or not layer.has_color:
+            if not layer.visible or not layer.has_artwork:
                 continue
             mask = self.masks.get(layer.id)
             if mask is None:
@@ -1293,12 +1646,12 @@ class MainWindow(QMainWindow):
         """Union of every visible cut outline, or None when there is no cut."""
         outlines = []
         for cut in self.project.cut_layers():
-            if not cut.visible or not cut.has_color:
+            if not cut.visible or not cut.has_artwork:
                 continue
             outline = self.outlines.get(cut.id)
             if outline is None:
                 raise ExportError(
-                    f"{cut.name} has no computed outline; pick its color first."
+                    f"{cut.name} has no computed outline; pick its color or paint it first."
                 )
             outlines.append(outline)
         if not outlines:
@@ -1360,7 +1713,9 @@ class MainWindow(QMainWindow):
                 continue
             mask = self.masks.get(layer.id)
             if mask is None:
-                raise ExportError(f"{layer.name} has no mask yet. Pick its color first.")
+                raise ExportError(
+                    f"{layer.name} has no mask yet. Pick its color or paint on it first."
+                )
             selected.append((layer, mask))
 
         if render:

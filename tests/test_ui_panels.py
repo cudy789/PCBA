@@ -5,7 +5,7 @@ import pytest
 from PIL import Image
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QFileDialog, QToolBar
+from PySide6.QtWidgets import QFileDialog
 
 from png_to_gerber.gui.main_window import MainWindow
 from png_to_gerber.gui.canvas import _checker_brush
@@ -245,7 +245,7 @@ def test_base_panel_open_button_loads_an_image(window, tmp_path, monkeypatch):
 
 
 def test_toolbar_keeps_only_the_checker_slider(window):
-    toolbar = window.findChildren(QToolBar)[0]
+    toolbar = window.main_toolbar
     actions = toolbar.actions()
     assert window.remove_bg_action not in actions
     assert window.base_visible_action not in actions
@@ -295,7 +295,7 @@ def checker_pixels(opacity):
 
 
 def test_checker_slider_lives_in_the_toolbar(window):
-    toolbar = window.findChildren(QToolBar)[0]
+    toolbar = window.main_toolbar
     widget = window.checker_slider
     parent = widget.parent()
     while parent is not None and parent is not toolbar:

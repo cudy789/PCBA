@@ -73,6 +73,9 @@ class Layer:
     # Non-empty => this layer is the negative of the listed layers (by id).
     negative_of: list[int] = field(default_factory=list)
     inverted: bool = False  # paint the opaque pixels this layer does not cover
+    # Horizontal runs (x, y, width, value) that override the computed mask.
+    # 1 forces a pixel on, -1 forces it off. Later runs win where they overlap.
+    manual: list[tuple[int, int, int, int]] = field(default_factory=list)
     id: int = field(default_factory=_next_layer_id)
 
     @property
@@ -82,6 +85,11 @@ class Layer:
     @property
     def is_derived(self) -> bool:
         return bool(self.negative_of)
+
+    @property
+    def has_artwork(self) -> bool:
+        """True when export has something to draw: a color, a negative, or painted pixels."""
+        return self.has_color or bool(self.negative_of) or bool(self.manual)
 
 
 class ProjectError(ValueError):
@@ -124,6 +132,9 @@ class BaseImage:
     flatten_colors: list = field(default_factory=default_flatten_colors)
     flatten_smooth: int = 0  # 0 off .. 5 strongest edge median
     visible: bool = True
+    # Pixels painted by hand, in source-image coordinates: (x, y, r, g, b, a).
+    # Applied on top of background removal and color flattening.
+    paint: list[tuple[int, int, int, int, int, int]] = field(default_factory=list)
     layers: list[Layer] = field(default_factory=list)
     id: int = field(default_factory=_next_image_id)
 
@@ -411,7 +422,7 @@ class Project:
         """Group enabled, colored artwork layers by (type, side) for merging."""
         groups: dict[tuple[LayerType, Side], list[Layer]] = {}
         for layer in self.artwork_layers():
-            if not layer.visible or not layer.has_color:
+            if not layer.visible or not layer.has_artwork:
                 continue
             groups.setdefault((layer.layer_type, layer.side), []).append(layer)
         return groups

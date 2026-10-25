@@ -10,6 +10,7 @@ from png_to_gerber.flatten import auto_cutoffs, even_cutoffs, histogram
 from png_to_gerber.gui.cutoff_bar import CutoffBar
 from png_to_gerber.gui.main_window import MainWindow
 from png_to_gerber.model import LayerType
+from png_to_gerber.paint import Tool, compose_painted
 
 
 def _gradient(width=60, height=30) -> np.ndarray:
@@ -133,6 +134,96 @@ def test_compare_original_swaps_the_canvas_but_not_the_mask(window):
     assert np.array_equal(window.masks[layer.id], mask)
     shown = window.canvas.base_item.pixmap().toImage().pixelColor(0, 0)
     assert (shown.red(), shown.green(), shown.blue()) == (0, 0, 0)
+    shown_mid = window.canvas.base_item.pixmap().toImage().pixelColor(30, 15)
+    assert (shown_mid.red(), shown_mid.green(), shown_mid.blue()) == tuple(
+        int(channel) for channel in window.original_image[15, 30, :3]
+    )
+    assert (shown_mid.red(), shown_mid.green(), shown_mid.blue()) != tuple(
+        int(channel) for channel in flat[15, 30, :3]
+    )
+
+
+def test_compare_original_follows_a_crop_changed_by_paint(qtbot, tmp_path):
+    """Erasing the edge shrinks the cropped image, so compare cannot require the old bounds."""
+    image = np.zeros((40, 70, 4), dtype=np.uint8)
+    ramp = np.linspace(0, 255, 60, dtype=np.uint8)
+    image[5:35, 5:65, 0] = ramp
+    image[5:35, 5:65, 1] = ramp
+    image[5:35, 5:65, 2] = ramp
+    image[5:35, 5:65, 3] = 255
+    path = tmp_path / "margin.png"
+    Image.fromarray(image, "RGBA").save(path)
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.load_image(path)
+    window.set_background_removed(True)
+    window.set_flatten(True)
+    window.layer_pane.select_base()
+    window.set_paint_tool(Tool.ERASE)
+    window.set_brush_size(1)
+    window.paint_stroke([(x, 0) for x in range(window.image.shape[1])])
+
+    image_model = window.active_image()
+    prepared = window._prepared_image(image_model)
+    assert prepared.shape[:2] != window.image.shape[:2]
+    flat = window.image.copy()
+    unflat = compose_painted(
+        window.original_image,
+        image_model.paint,
+        removed=True,
+        tolerance=image_model.background_tolerance,
+        flatten=False,
+    )
+    assert unflat.shape[:2] == flat.shape[:2]
+    sample_y, sample_x = flat.shape[0] // 2, flat.shape[1] // 2
+    assert tuple(unflat[sample_y, sample_x]) != tuple(flat[sample_y, sample_x])
+
+    layer = window.add_layer(LayerType.COPPER)
+    color = tuple(int(channel) for channel in flat[sample_y, sample_x, :3])
+    window.inspector.apply_color(color)
+    layer.tolerance = 0
+    layer.close_radius = 0
+    layer.min_island = 0
+    window.flush_recompute()
+    mask = window.masks[layer.id].copy()
+
+    window.base_panel.compare_check.setChecked(True)
+    window.flush_recompute()
+    assert window.base_panel.compare_check.isChecked()
+    assert np.array_equal(window.image, flat)
+    assert np.array_equal(window.masks[layer.id], mask)
+    pixmap = window.canvas.base_item.pixmap().toImage()
+    assert (pixmap.width(), pixmap.height()) == (unflat.shape[1], unflat.shape[0])
+    shown = pixmap.pixelColor(sample_x, sample_y)
+    assert (shown.red(), shown.green(), shown.blue(), shown.alpha()) == tuple(
+        int(channel) for channel in unflat[sample_y, sample_x]
+    )
+
+    window.base_panel.compare_check.setChecked(False)
+    window.flush_recompute()
+    restored = window.canvas.base_item.pixmap().toImage().pixelColor(sample_x, sample_y)
+    assert (restored.red(), restored.green(), restored.blue(), restored.alpha()) == tuple(
+        int(channel) for channel in flat[sample_y, sample_x]
+    )
+
+
+def test_compare_original_reveals_a_hidden_base_image(window):
+    window.set_flatten(True)
+    image = window.active_image()
+    window._set_image_visible(image.id, False)
+    assert not window.canvas.base_item.isVisible()
+
+    window.base_panel.compare_check.setChecked(True)
+    assert window.canvas.base_item.isVisible()
+    assert image.visible is False
+    shown = window.canvas.base_item.pixmap().toImage().pixelColor(30, 15)
+    assert (shown.red(), shown.green(), shown.blue()) == tuple(
+        int(channel) for channel in window.original_image[15, 30, :3]
+    )
+
+    window.base_panel.compare_check.setChecked(False)
+    assert not window.canvas.base_item.isVisible()
 
 
 def test_panel_follows_programmatic_flatten_settings(window):
