@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import tempfile
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
 from PIL import UnidentifiedImageError
 from shapely.ops import unary_union
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtGui import QAction, QKeyEvent, QMouseEvent
 from PySide6.QtWidgets import (
     QApplication,
     QDockWidget,
@@ -40,6 +41,7 @@ from ..image_export import (
     render_pcb,
     save_rgba,
 )
+from ..history import EditHistory, capture_state, clone_project
 from ..image_io import canvas_size as shared_canvas_size
 from ..image_io import dominant_colors, load_rgba, pad_top_left
 from ..masking import build_mask, invert_mask, negative_mask
@@ -106,6 +108,13 @@ class MainWindow(QMainWindow):
         self._dirty_layers: set[int] = set()
         self._modified = False
         self._stroke: dict | None = None
+        self._history = EditHistory()
+        self._edit_depth = 0
+        self._edit_pending = False
+        self._open_gesture: str | None = None
+        self._restoring = False
+        self._history_locked = False
+        self._gesture_names: dict[QWidget, str] = {}
 
         self._recompute_timer = QTimer(self)
         self._recompute_timer.setSingleShot(True)
@@ -172,14 +181,26 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
 
         self._build_actions()
+        self._bind_gestures()
         self._connect_base_controls()
         self.layer_pane.select_base()
+        self._history.reset(self._capture())
+        self._update_undo_actions()
         self._update_title()
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self.statusBar().showMessage("Open an image or a project to begin.")
 
     # ---- UI construction ------------------------------------------------------------
 
     def _build_actions(self):
+        self.undo_action = QAction("&Undo", self)
+        self.undo_action.setShortcut("Ctrl+Z")
+        self.undo_action.triggered.connect(self.undo)
+        self.redo_action = QAction("&Redo", self)
+        self.redo_action.setShortcut("Ctrl+Shift+Z")
+        self.redo_action.triggered.connect(self.redo)
         self.open_project_action = QAction("Open &project...", self)
         self.open_project_action.setShortcut("Ctrl+Shift+O")
         self.open_project_action.triggered.connect(self._on_open_project)
@@ -228,6 +249,9 @@ class MainWindow(QMainWindow):
 
         file_menu = self.menuBar().addMenu("&File")
         for action in (
+            self.undo_action,
+            self.redo_action,
+            None,
             self.open_project_action,
             self.save_action,
             self.save_as_action,
@@ -253,6 +277,28 @@ class MainWindow(QMainWindow):
         self.checker_label = QLabel("Checker opacity", self)
         toolbar.addWidget(self.checker_label)
         toolbar.addWidget(self.checker_slider)
+
+    def _bind_gestures(self):
+        """A drag or a held spin arrow is one undo step; a click is its own."""
+        self._gesture_names = {
+            self.inspector.tolerance_slider: "tolerance",
+            self.inspector.smooth_slider: "smoothness",
+            self.inspector.close_spin: "close-radius",
+            self.inspector.island_spin: "min-island",
+            self.base_panel.tolerance_spin: "bg-tolerance",
+            self.base_panel.count_spin: "flatten-count",
+            self.base_panel.smooth_slider: "flatten-smooth",
+            self.base_panel.cutoff_bar: "flatten-cutoffs",
+            self.checker_slider: "checker",
+        }
+        for widget, name in self._gesture_names.items():
+            if isinstance(widget, QSlider):
+                widget.sliderPressed.connect(lambda n=name: self._begin_gesture(n))
+                widget.sliderReleased.connect(self._finish_gesture)
+        self.base_panel.cutoff_bar.drag_started.connect(
+            lambda: self._begin_gesture("flatten-cutoffs")
+        )
+        self.base_panel.cutoff_bar.drag_finished.connect(self._finish_gesture)
 
     def _connect_base_controls(self):
         """Keep the base-image row/panel and the menu actions in step."""
@@ -308,20 +354,196 @@ class MainWindow(QMainWindow):
         action.setChecked(checked)
         action.blockSignals(False)
 
-    # ---- modified tracking ---------------------------------------------------------------
+    # ---- modified tracking and undo ------------------------------------------------------
 
     @property
     def is_modified(self) -> bool:
         return self._modified
 
     def _mark_modified(self):
-        if not self._modified:
-            self._modified = True
-            self._update_title()
+        if self._restoring or self._history_locked:
+            return
+        self._edit_pending = True
+        if self._edit_depth == 0:
+            self._flush_edit()
 
     def _set_unmodified(self):
         self._modified = False
         self._update_title()
+
+    def _sync_modified(self):
+        modified = not self._history.at_saved
+        if modified != self._modified:
+            self._modified = modified
+            self._update_title()
+
+    @contextmanager
+    def _edit(self):
+        """Group every mutation inside one user action into a single history step."""
+        self._edit_depth += 1
+        flag = {"mode": "edit"}
+        try:
+            yield flag
+        finally:
+            self._edit_depth -= 1
+            if self._edit_depth == 0:
+                self._flush_edit(mode=flag["mode"])
+
+    def _flush_edit(self, mode: str = "edit"):
+        if self._restoring or self._history_locked:
+            self._edit_pending = False
+            return
+        if mode == "baseline":
+            self._open_gesture = None
+            self._history.reset(self._capture())
+            self._edit_pending = False
+            self._sync_modified()
+            self._update_undo_actions()
+            return
+        if not self._edit_pending and mode != "checkpoint":
+            return
+        self._edit_pending = False
+        self._history.commit(
+            self._capture(),
+            gesture=self._open_gesture,
+            saved=mode == "checkpoint",
+        )
+        self._sync_modified()
+        self._update_undo_actions()
+
+    def _capture(self):
+        layer_id, image_id = self._selection()
+        return capture_state(self.project, self._originals, layer_id, image_id)
+
+    def _selection(self) -> tuple[int | None, int | None]:
+        layer_id = self.layer_pane.current_layer_id()
+        image_id = self.layer_pane.current_image_id()
+        if layer_id is None or layer_id < 0:
+            layer_id = None
+        return layer_id, image_id
+
+    def _note_selection(self):
+        if self._restoring or self._history_locked or self._edit_depth or not self._history.states:
+            return
+        layer_id, image_id = self._selection()
+        self._history.set_selection(layer_id, image_id)
+
+    def _begin_gesture(self, name: str) -> None:
+        self._open_gesture = name
+
+    def _finish_gesture(self) -> None:
+        if self._edit_depth:
+            QTimer.singleShot(0, self, self._finish_gesture)
+            return
+        self._open_gesture = None
+        self._history.end_gesture()
+        self._sync_modified()
+        self._update_undo_actions()
+
+    def _schedule_gesture_finish(self) -> None:
+        QTimer.singleShot(0, self, self._finish_gesture)
+
+    def _update_undo_actions(self) -> None:
+        self.undo_action.setEnabled(self._history.can_undo)
+        self.redo_action.setEnabled(self._history.can_redo)
+
+    def undo(self) -> None:
+        """Return to the previous project state. Ctrl+Z and File > Undo."""
+        self._open_gesture = None
+        state = self._history.undo()
+        if state is None:
+            self._sync_modified()
+            self._update_undo_actions()
+            return
+        self._restore(state)
+        self.statusBar().showMessage("Undone.")
+
+    def redo(self) -> None:
+        """Reapply the state undone last. Ctrl+Shift+Z and File > Redo."""
+        self._open_gesture = None
+        state = self._history.redo()
+        if state is None:
+            self._sync_modified()
+            self._update_undo_actions()
+            return
+        self._restore(state)
+        self.statusBar().showMessage("Redone.")
+
+    def _restore(self, state) -> None:
+        self._restoring = True
+        try:
+            self._stroke = None
+            self.canvas.cancel_rectangle()
+            self.project = clone_project(state.project)
+            self._originals = dict(state.originals)
+            self._working.clear()
+            self._palettes.clear()
+            self.masks.clear()
+            self.outlines.clear()
+            self._dirty_layers.clear()
+            alive = {image.id for image in self.project.images}
+            self._comparing &= alive
+            for image in self.project.images:
+                if image.id in self._originals:
+                    self._working[image.id] = self._compose_working(image)
+            self.checker_slider.blockSignals(True)
+            self.checker_slider.setValue(self.project.checker_opacity)
+            self.checker_slider.blockSignals(False)
+            self.canvas.set_checker_opacity(self.project.checker_opacity)
+            self._refresh_canvas(fit=False)
+            if state.selected_layer is not None and self.project.get_layer(state.selected_layer):
+                self._refresh_layers(selected_id=state.selected_layer)
+            elif state.selected_image is not None and self.project.get_image(state.selected_image):
+                self._refresh_layers(selected_image_id=state.selected_image)
+            else:
+                self._refresh_layers()
+                if self.project.images:
+                    self.layer_pane.select_base(self.project.images[0].id)
+            self.flush_recompute()
+            self._sync_modified()
+            self._update_undo_actions()
+        finally:
+            self._restoring = False
+
+    def eventFilter(self, watched, event) -> bool:
+        """Coalesce a held arrow or a pointer drag on a continuous control."""
+        event_type = event.type()
+        if event_type == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
+            if event.button() == Qt.MouseButton.LeftButton:
+                name = self._gesture_name_for(watched)
+                if name:
+                    self._begin_gesture(name)
+        elif event_type == QEvent.Type.MouseButtonRelease and isinstance(event, QMouseEvent):
+            if event.button() == Qt.MouseButton.LeftButton and self._open_gesture:
+                self._schedule_gesture_finish()
+        elif event_type == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
+            if (
+                not event.isAutoRepeat()
+                and event.key()
+                in (
+                    Qt.Key.Key_Up,
+                    Qt.Key.Key_Down,
+                    Qt.Key.Key_Left,
+                    Qt.Key.Key_Right,
+                    Qt.Key.Key_PageUp,
+                    Qt.Key.Key_PageDown,
+                )
+                and self._gesture_name_for(watched)
+            ):
+                self._begin_gesture(self._gesture_name_for(watched))
+        elif event_type == QEvent.Type.KeyRelease and isinstance(event, QKeyEvent):
+            if not event.isAutoRepeat() and self._open_gesture:
+                self._schedule_gesture_finish()
+        return False
+
+    def _gesture_name_for(self, obj) -> str | None:
+        widget = obj if isinstance(obj, QWidget) else None
+        while widget is not None:
+            name = self._gesture_names.get(widget)
+            if name:
+                return name
+            widget = widget.parentWidget()
+        return None
 
     def _update_title(self):
         name = self.project_path.name if self.project_path else "untitled"
@@ -395,62 +617,89 @@ class MainWindow(QMainWindow):
         """Replace the active image (or open the first one). Layers stay put."""
         original = load_rgba(path)
         path = Path(path)
-        image = self.active_image()
-        if image is None:
-            image = self.project.add_image(name=path.name, path=str(path))
-        else:
-            image.name = path.name
-            image.path = str(path)
-            image.background_removed = False
-            image.paint = []
-            for layer in image.layers:
-                layer.manual = []
-            reset_flatten(image)
-            self._comparing.discard(image.id)
-        self._originals[image.id] = original
-        self._working[image.id] = original
-        self._palettes.pop(image.id, None)
-        self._set_checked(self.remove_bg_action, False)
-        self._refresh_canvas(fit=True)
-        self._refresh_layers(selected_image_id=image.id)
-        if self.project.layers or self.project_path is not None:
-            self._mark_modified()  # a bare image with no work in it isn't worth saving
-        self.statusBar().showMessage(
-            f"Loaded {path.name} ({original.shape[1]} x {original.shape[0]} px)"
-        )
+        had_pixels = bool(self._originals)
+        fresh = not self._modified and not self._history.can_undo
+        with self._edit() as edit:
+            image = self.active_image()
+            if image is None:
+                image = self.project.add_image(name=path.name, path=str(path))
+            else:
+                image.name = path.name
+                image.path = str(path)
+                image.background_removed = False
+                image.paint = []
+                for layer in image.layers:
+                    layer.manual = []
+                reset_flatten(image)
+                self._comparing.discard(image.id)
+            self._originals[image.id] = original
+            self._working[image.id] = original
+            self._palettes.pop(image.id, None)
+            self._set_checked(self.remove_bg_action, False)
+            self._refresh_canvas(fit=True)
+            self._refresh_layers(selected_image_id=image.id)
+            # A bare image with no work in it isn't worth saving. The first one
+            # becomes the baseline; replacing that clean image stays undoable.
+            clean = not self.project.layers and self.project_path is None and not self._modified
+            if clean and not had_pixels and fresh:
+                edit["mode"] = "baseline"
+            elif clean:
+                edit["mode"] = "checkpoint"
+                self._edit_pending = True
+            else:
+                self._mark_modified()
+            self.statusBar().showMessage(
+                f"Loaded {path.name} ({original.shape[1]} x {original.shape[0]} px)"
+            )
 
     def add_image(self, path: str | Path):
         """Open another base image. Its layers will be nested under it."""
         original = load_rgba(path)
         path = Path(path)
-        image = self.project.add_image(name=path.name, path=str(path))
-        self._originals[image.id] = original
-        self._working[image.id] = original
-        if len(self.project.images) > 1 or self.project.layers or self.project_path is not None:
-            self._mark_modified()
-        self._refresh_canvas(fit=True)
-        self._refresh_layers(selected_image_id=image.id)
-        self.statusBar().showMessage(
-            f"Added {path.name} ({original.shape[1]} x {original.shape[0]} px)"
-        )
+        had_pixels = bool(self._originals)
+        fresh = not self._modified and not self._history.can_undo
+        with self._edit() as edit:
+            image = self.project.add_image(name=path.name, path=str(path))
+            self._originals[image.id] = original
+            self._working[image.id] = original
+            self._refresh_canvas(fit=True)
+            self._refresh_layers(selected_image_id=image.id)
+            clean = (
+                len(self.project.images) <= 1
+                and not self.project.layers
+                and self.project_path is None
+                and not self._modified
+            )
+            if clean and not had_pixels and fresh:
+                edit["mode"] = "baseline"
+            elif len(self.project.images) > 1 or self.project.layers or self.project_path is not None or self._modified:
+                self._mark_modified()
+            else:
+                edit["mode"] = "checkpoint"
+                self._edit_pending = True
+            self.statusBar().showMessage(
+                f"Added {path.name} ({original.shape[1]} x {original.shape[0]} px)"
+            )
         return image
 
     def remove_image(self, image_id: int) -> None:
         """Remove one base image and the layers nested under it."""
-        removed = self.project.remove_image(image_id)
-        self._originals.pop(image_id, None)
-        self._working.pop(image_id, None)
-        self._palettes.pop(image_id, None)
-        self._comparing.discard(image_id)
-        for layer_id in removed:
-            self.masks.pop(layer_id, None)
-            self.outlines.pop(layer_id, None)
-            self._dirty_layers.discard(layer_id)
-            self.canvas.remove_layer_items(layer_id)
-        self._refresh_canvas(fit=True)
-        self._refresh_layers()
-        if removed or image_id is not None:
-            self._mark_modified()
+        with self._edit():
+            existed = self.project.get_image(image_id) is not None
+            removed = self.project.remove_image(image_id)
+            self._originals.pop(image_id, None)
+            self._working.pop(image_id, None)
+            self._palettes.pop(image_id, None)
+            self._comparing.discard(image_id)
+            for layer_id in removed:
+                self.masks.pop(layer_id, None)
+                self.outlines.pop(layer_id, None)
+                self._dirty_layers.discard(layer_id)
+                self.canvas.remove_layer_items(layer_id)
+            self._refresh_canvas(fit=True)
+            self._refresh_layers()
+            if existed:
+                self._mark_modified()
 
     def _refresh_canvas(self, fit: bool) -> None:
         """Redraw every base image on the shared top-left canvas."""
@@ -582,43 +831,44 @@ class MainWindow(QMainWindow):
         smooth: int | None = None,
     ) -> None:
         """Update the active image's flatten settings and rebuild its working pixels."""
-        image = self.active_image()
-        if image is None:
-            self.statusBar().showMessage("Open an image first.")
-            self._sync_base_controls()
-            return
-        before = self._flatten_signature(image)
-        if count is not None and int(count) != image.flatten_count:
-            count = int(count)
-            if cutoffs is None:
-                cutoffs = even_cutoffs(count)
-            if colors is None:
-                old = list(image.flatten_colors)
-                colors = [old[index] if index < len(old) else None for index in range(count)]
-            image.flatten_count = count
-        elif count is not None:
-            image.flatten_count = int(count)
-        if cutoffs is not None:
-            image.flatten_cutoffs = [int(value) for value in cutoffs]
-        if colors is not None:
-            image.flatten_colors = [
-                None if color is None else (int(color[0]), int(color[1]), int(color[2]))
-                for color in colors
-            ]
-        if smooth is not None:
-            image.flatten_smooth = int(smooth)
-        if enabled is not None:
-            image.flatten_enabled = bool(enabled)
-            if not image.flatten_enabled:
-                self._comparing.discard(image.id)
-        self._align_flatten(image)
-        changed = self._flatten_signature(image) != before
-        if changed:
-            self._mark_modified()
-        if changed and image.id in self._originals:
-            self._rebuild_working(image)
-        else:
-            self._sync_base_controls()
+        with self._edit():
+            image = self.active_image()
+            if image is None:
+                self.statusBar().showMessage("Open an image first.")
+                self._sync_base_controls()
+                return
+            before = self._flatten_signature(image)
+            if count is not None and int(count) != image.flatten_count:
+                count = int(count)
+                if cutoffs is None:
+                    cutoffs = even_cutoffs(count)
+                if colors is None:
+                    old = list(image.flatten_colors)
+                    colors = [old[index] if index < len(old) else None for index in range(count)]
+                image.flatten_count = count
+            elif count is not None:
+                image.flatten_count = int(count)
+            if cutoffs is not None:
+                image.flatten_cutoffs = [int(value) for value in cutoffs]
+            if colors is not None:
+                image.flatten_colors = [
+                    None if color is None else (int(color[0]), int(color[1]), int(color[2]))
+                    for color in colors
+                ]
+            if smooth is not None:
+                image.flatten_smooth = int(smooth)
+            if enabled is not None:
+                image.flatten_enabled = bool(enabled)
+                if not image.flatten_enabled:
+                    self._comparing.discard(image.id)
+            self._align_flatten(image)
+            changed = self._flatten_signature(image) != before
+            if changed:
+                self._mark_modified()
+            if changed and image.id in self._originals:
+                self._rebuild_working(image)
+            else:
+                self._sync_base_controls()
 
     def _on_flatten_toggled(self, enabled: bool) -> None:
         image = self.active_image()
@@ -719,43 +969,45 @@ class MainWindow(QMainWindow):
 
     def set_background_removed(self, enabled: bool, tolerance: int | None = None) -> None:
         """Make the active image's outer background transparent (or restore it)."""
-        image = self.active_image()
-        original = self._originals.get(image.id) if image is not None else None
-        if image is not None and tolerance is not None:
-            image.background_tolerance = int(tolerance)
-        if original is None or image is None:
-            self._set_checked(self.remove_bg_action, False)
-            self._sync_base_controls()
-            self.statusBar().showMessage("Open an image first.")
-            return
-        if enabled != image.background_removed or tolerance is not None:
-            self._mark_modified()
-        image.background_removed = enabled
-        self._set_checked(self.remove_bg_action, enabled)
-        if enabled:
-            cleared = remove_background(original, image.background_tolerance)
-            removed_px = int(((original[..., 3] > 0) & (cleared[..., 3] == 0)).sum())
-        pixels = self._rebuild_working(image)
-        if pixels is None:
-            return
-        if enabled:
-            message = (
-                f"Background removed ({removed_px:,} px made transparent). "
-                f"Image cropped to {pixels.shape[1]} x {pixels.shape[0]} px."
-            )
-        else:
-            message = "Background restored."
-        self.statusBar().showMessage(message)
+        with self._edit():
+            image = self.active_image()
+            original = self._originals.get(image.id) if image is not None else None
+            if image is not None and tolerance is not None:
+                image.background_tolerance = int(tolerance)
+            if original is None or image is None:
+                self._set_checked(self.remove_bg_action, False)
+                self._sync_base_controls()
+                self.statusBar().showMessage("Open an image first.")
+                return
+            if enabled != image.background_removed or tolerance is not None:
+                self._mark_modified()
+            image.background_removed = enabled
+            self._set_checked(self.remove_bg_action, enabled)
+            if enabled:
+                cleared = remove_background(original, image.background_tolerance)
+                removed_px = int(((original[..., 3] > 0) & (cleared[..., 3] == 0)).sum())
+            pixels = self._rebuild_working(image)
+            if pixels is None:
+                return
+            if enabled:
+                message = (
+                    f"Background removed ({removed_px:,} px made transparent). "
+                    f"Image cropped to {pixels.shape[1]} x {pixels.shape[0]} px."
+                )
+            else:
+                message = "Background restored."
+            self.statusBar().showMessage(message)
 
     def _on_bg_tolerance(self, value: int):
-        image = self.active_image()
-        if image is None:
-            return
-        if value != image.background_tolerance:
-            image.background_tolerance = value
-            self._mark_modified()
-        if image.background_removed:
-            self.set_background_removed(True)
+        with self._edit():
+            image = self.active_image()
+            if image is None:
+                return
+            if value != image.background_tolerance:
+                image.background_tolerance = value
+                self._mark_modified()
+            if image.background_removed:
+                self.set_background_removed(True)
 
     def _on_base_eye(self, image_id, visible: bool):
         if image_id is None:
@@ -763,16 +1015,17 @@ class MainWindow(QMainWindow):
         self._set_image_visible(image_id, bool(visible))
 
     def _set_image_visible(self, image_id: int, visible: bool) -> None:
-        image = self.project.get_image(image_id)
-        if image is None:
-            return
-        if image.visible != visible:
-            image.visible = visible
-            self._mark_modified()
-        self.canvas.set_base_visible(self._base_shown(image), image_id)
-        self.layer_pane.show_image_visibility(image_id, visible)
-        if self.active_image() is image:
-            self._set_checked(self.base_visible_action, visible)
+        with self._edit():
+            image = self.project.get_image(image_id)
+            if image is None:
+                return
+            if image.visible != visible:
+                image.visible = visible
+                self._mark_modified()
+            self.canvas.set_base_visible(self._base_shown(image), image_id)
+            self.layer_pane.show_image_visibility(image_id, visible)
+            if self.active_image() is image:
+                self._set_checked(self.base_visible_action, visible)
 
     def _on_base_visible_toggled(self, visible: bool):
         image = self.active_image()
@@ -782,10 +1035,11 @@ class MainWindow(QMainWindow):
         self._set_image_visible(image.id, visible)
 
     def _on_checker_opacity(self, percent: int):
-        self.canvas.set_checker_opacity(percent)
-        if percent != self.project.checker_opacity:
-            self.project.checker_opacity = percent
-            self._mark_modified()
+        with self._edit():
+            self.canvas.set_checker_opacity(percent)
+            if percent != self.project.checker_opacity:
+                self.project.checker_opacity = percent
+                self._mark_modified()
 
     def _on_add_image(self):
         path, _ = QFileDialog.getOpenFileName(self, "Add image", "", IMAGE_FILTER)
@@ -813,164 +1067,173 @@ class MainWindow(QMainWindow):
     # ---- layers -------------------------------------------------------------------
 
     def add_layer(self, layer_type: LayerType) -> Layer | None:
-        if self.image is None:
-            QMessageBox.information(
-                self, "Add layer", "Open an image before adding layers."
-            )
-            return None
-        name = default_layer_name(layer_type, self.project.layers)
-        image = self.active_image()
-        try:
-            layer = self.project.add_layer(
-                Layer(name=name, layer_type=layer_type),
-                image_id=image.id if image is not None else None,
-            )
-        except ProjectError as e:
-            QMessageBox.warning(self, "Add layer", str(e))
-            return None
-        self._refresh_layers(selected_id=layer.id)
-        self._mark_modified()
-        return layer
+        with self._edit():
+            if self.image is None:
+                QMessageBox.information(
+                    self, "Add layer", "Open an image before adding layers."
+                )
+                return None
+            name = default_layer_name(layer_type, self.project.layers)
+            image = self.active_image()
+            try:
+                layer = self.project.add_layer(
+                    Layer(name=name, layer_type=layer_type),
+                    image_id=image.id if image is not None else None,
+                )
+            except ProjectError as e:
+                QMessageBox.warning(self, "Add layer", str(e))
+                return None
+            self._refresh_layers(selected_id=layer.id)
+            self._mark_modified()
+            return layer
 
     def duplicate_layer(self, layer_id: int) -> Layer | None:
         """Add a new layer with the same settings, placed just below the original."""
-        source = self.project.get_layer(layer_id)
-        if source is None:
-            return None
-        copy = Layer(
-            name=duplicate_layer_name(source.name, self.project.layers),
-            layer_type=source.layer_type,
-            side=source.side,
-            color=source.color,
-            tolerance=source.tolerance,
-            close_radius=source.close_radius,
-            min_island=source.min_island,
-            fill_holes=source.fill_holes,
-            smoothness=source.smoothness,
-            outline_mode=source.outline_mode,
-            visible=source.visible,
-            has_color=source.has_color,
-            negative_of=list(source.negative_of),
-            inverted=source.inverted,
-            manual=[tuple(run) for run in source.manual],
-        )
-        owner = self.project.image_of(source.id)
-        try:
-            self.project.add_layer(
-                copy, after_id=source.id, image_id=owner.id if owner is not None else None
+        with self._edit():
+            source = self.project.get_layer(layer_id)
+            if source is None:
+                return None
+            copy = Layer(
+                name=duplicate_layer_name(source.name, self.project.layers),
+                layer_type=source.layer_type,
+                side=source.side,
+                color=source.color,
+                tolerance=source.tolerance,
+                close_radius=source.close_radius,
+                min_island=source.min_island,
+                fill_holes=source.fill_holes,
+                smoothness=source.smoothness,
+                outline_mode=source.outline_mode,
+                visible=source.visible,
+                has_color=source.has_color,
+                negative_of=list(source.negative_of),
+                inverted=source.inverted,
+                manual=[tuple(run) for run in source.manual],
             )
-        except ProjectError as e:
-            QMessageBox.warning(self, "Duplicate layer", str(e))
-            return None
-        self._refresh_layers(selected_id=copy.id)
-        if copy.has_artwork:
-            self._mark_dirty(copy.id)
-        self._mark_modified()
-        return copy
+            owner = self.project.image_of(source.id)
+            try:
+                self.project.add_layer(
+                    copy, after_id=source.id, image_id=owner.id if owner is not None else None
+                )
+            except ProjectError as e:
+                QMessageBox.warning(self, "Duplicate layer", str(e))
+                return None
+            self._refresh_layers(selected_id=copy.id)
+            if copy.has_artwork:
+                self._mark_dirty(copy.id)
+            self._mark_modified()
+            return copy
 
     def change_layer_type(self, new_type: LayerType) -> bool:
         """Retype the selected layer. Each cut layer stays one closed perimeter."""
-        layer = self.selected_layer()
-        if layer is None or layer.layer_type == new_type:
-            return False
-        if new_type == LayerType.CUT and layer.is_derived:
-            QMessageBox.warning(
-                self,
-                "Layer type",
-                "A negative layer cannot be a cut layer.",
-            )
-            self.inspector.set_layer(layer, self._source_names(layer))
-            return False
-        layer.layer_type = new_type
-        self._refresh_layers(selected_id=layer.id)
-        self._mark_dirty(layer.id)
-        self._mark_modified()
-        return True
+        with self._edit():
+            layer = self.selected_layer()
+            if layer is None or layer.layer_type == new_type:
+                return False
+            if new_type == LayerType.CUT and layer.is_derived:
+                QMessageBox.warning(
+                    self,
+                    "Layer type",
+                    "A negative layer cannot be a cut layer.",
+                )
+                self.inspector.set_layer(layer, self._source_names(layer))
+                return False
+            layer.layer_type = new_type
+            self._refresh_layers(selected_id=layer.id)
+            self._mark_dirty(layer.id)
+            self._mark_modified()
+            return True
 
     def generate_negative(
         self, source_ids: list[int], layer_type: LayerType = LayerType.COPPER
     ) -> Layer | None:
         """Create a layer covering everything the given layers do not."""
-        if self.image is None:
-            QMessageBox.information(self, "Generate negative", "Open an image first.")
-            return None
-        if layer_type not in NEGATIVE_TYPES:
-            QMessageBox.warning(
-                self,
-                "Generate negative",
-                "A negative can be copper, solder mask opening, or silkscreen.",
-            )
-            return None
-        sources = [self.project.get_layer(i) for i in source_ids]
-        sources = [s for s in sources if s is not None]
-        if not sources:
-            QMessageBox.information(
-                self, "Generate negative", "Select at least one layer first."
-            )
-            return None
-        uncolored = [
-            s.name for s in sources if not s.is_derived and not s.has_color and not s.manual
-        ]
-        if uncolored:
-            QMessageBox.warning(
-                self,
-                "Generate negative",
-                "Pick a color for these layers first:\n" + "\n".join(uncolored),
-            )
-            return None
+        with self._edit():
+            if self.image is None:
+                QMessageBox.information(self, "Generate negative", "Open an image first.")
+                return None
+            if layer_type not in NEGATIVE_TYPES:
+                QMessageBox.warning(
+                    self,
+                    "Generate negative",
+                    "A negative can be copper, solder mask opening, or silkscreen.",
+                )
+                return None
+            sources = [self.project.get_layer(i) for i in source_ids]
+            sources = [s for s in sources if s is not None]
+            if not sources:
+                QMessageBox.information(
+                    self, "Generate negative", "Select at least one layer first."
+                )
+                return None
+            uncolored = [
+                s.name for s in sources if not s.is_derived and not s.has_color and not s.manual
+            ]
+            if uncolored:
+                QMessageBox.warning(
+                    self,
+                    "Generate negative",
+                    "Pick a color for these layers first:\n" + "\n".join(uncolored),
+                )
+                return None
 
-        name = "Negative of " + ", ".join(s.name for s in sources)
-        sided = next((s for s in sources if not s.is_cut), None)
-        layer = Layer(
-            name=name,
-            layer_type=layer_type,
-            side=sided.side if sided is not None else Side.FRONT,
-            min_island=4,
-            has_color=True,
-            negative_of=[s.id for s in sources],
-        )
-        image = self.active_image()
-        self.project.add_layer(layer, image_id=image.id if image is not None else None)
-        self._refresh_layers(selected_id=layer.id)
-        self._mark_dirty(layer.id)
-        self._mark_modified()
-        return layer
+            name = "Negative of " + ", ".join(s.name for s in sources)
+            sided = next((s for s in sources if not s.is_cut), None)
+            layer = Layer(
+                name=name,
+                layer_type=layer_type,
+                side=sided.side if sided is not None else Side.FRONT,
+                min_island=4,
+                has_color=True,
+                negative_of=[s.id for s in sources],
+            )
+            image = self.active_image()
+            self.project.add_layer(layer, image_id=image.id if image is not None else None)
+            self._refresh_layers(selected_id=layer.id)
+            self._mark_dirty(layer.id)
+            self._mark_modified()
+            return layer
 
     def remove_layer(self, layer_id: int) -> None:
-        affected = self.project.dependents(layer_id)
-        removed = self.project.remove_layer(layer_id)
-        for rid in removed:
-            self.masks.pop(rid, None)
-            self.outlines.pop(rid, None)
-            self._dirty_layers.discard(rid)
-            self.canvas.remove_layer_items(rid)
-        self._refresh_layers()
-        if self.selected_layer() is None:
-            self.layer_pane.select_base()
-        remaining = [a for a in affected if a not in removed]
-        if remaining:
-            self._mark_dirty(*remaining)
-        if removed:
-            self._mark_modified()
-        if len(removed) > 1:
-            self.statusBar().showMessage(
-                f"Also removed {len(removed) - 1} negative layer(s) that depended "
-                "only on the deleted layer."
-            )
+        with self._edit():
+            affected = self.project.dependents(layer_id)
+            removed = self.project.remove_layer(layer_id)
+            for rid in removed:
+                self.masks.pop(rid, None)
+                self.outlines.pop(rid, None)
+                self._dirty_layers.discard(rid)
+                self.canvas.remove_layer_items(rid)
+            self._refresh_layers()
+            if self.selected_layer() is None:
+                self.layer_pane.select_base()
+            remaining = [a for a in affected if a not in removed]
+            if remaining:
+                self._mark_dirty(*remaining)
+            if removed:
+                self._mark_modified()
+            if len(removed) > 1:
+                self.statusBar().showMessage(
+                    f"Also removed {len(removed) - 1} negative layer(s) that depended "
+                    "only on the deleted layer."
+                )
 
     def move_layer(self, layer_id: int, delta: int) -> None:
-        self.project.move_layer(layer_id, delta)
-        self._refresh_layers(selected_id=layer_id)
-        self._mark_modified()
+        with self._edit():
+            before = [layer.id for layer in self.project.layers]
+            self.project.move_layer(layer_id, delta)
+            self._refresh_layers(selected_id=layer_id)
+            if [layer.id for layer in self.project.layers] != before:
+                self._mark_modified()
 
     def set_layer_visible(self, layer_id: int, visible: bool) -> None:
-        layer = self.project.get_layer(layer_id)
-        if layer is not None:
-            if layer.visible != visible:
-                self._mark_modified()
-            layer.visible = visible
-            self.canvas.set_layer_visible(layer_id, visible)
-            self.layer_pane.show_layer_visibility(layer_id, visible)  # keep the eye in sync
+        with self._edit():
+            layer = self.project.get_layer(layer_id)
+            if layer is not None:
+                if layer.visible != visible:
+                    layer.visible = visible
+                    self._mark_modified()
+                self.canvas.set_layer_visible(layer_id, visible)
+                self.layer_pane.show_layer_visibility(layer_id, visible)  # keep the eye in sync
 
     def selected_layer(self) -> Layer | None:
         return self.project.get_layer(self.layer_pane.current_layer_id())
@@ -989,25 +1252,29 @@ class MainWindow(QMainWindow):
         parent = self.project.image_of(layer_id) if layer is not None else None
         if parent is not None and parent.id in self._working:
             self.inspector.set_dominant_colors(self._colors_for(parent.id))
+        self._note_selection()
 
     def _on_base_selected(self, image_id=None):
         self.inspector_stack.setCurrentWidget(self.base_panel)
         self._sync_base_controls()
         self._sync_paint_controls()
+        self._note_selection()
 
     def _on_layer_renamed(self, layer_id: int, name: str):
-        layer = self.project.get_layer(layer_id)
-        if layer is not None and name.strip() and layer.name != name.strip():
-            layer.name = name.strip()
-            self.layer_pane.show_layer_name(layer.id, layer.name)
-            self._mark_modified()
+        with self._edit():
+            layer = self.project.get_layer(layer_id)
+            if layer is not None and name.strip() and layer.name != name.strip():
+                layer.name = name.strip()
+                self.layer_pane.show_layer_name(layer.id, layer.name)
+                self._mark_modified()
 
     def _on_layer_edited(self):
-        layer = self.selected_layer()
-        if layer is not None:
-            self.layer_pane.note_layer_changed(layer)
-            self._mark_dirty(layer.id)
-            self._mark_modified()
+        with self._edit():
+            layer = self.selected_layer()
+            if layer is not None:
+                self.layer_pane.note_layer_changed(layer)
+                self._mark_dirty(layer.id)
+                self._mark_modified()
 
     def _on_pixel_picked(self, x: int, y: int):
         image = self.image
@@ -1157,26 +1424,27 @@ class MainWindow(QMainWindow):
             self._stroke["last"] = point
 
     def end_paint_stroke(self) -> None:
-        stroke = self._stroke
-        self._stroke = None
-        if stroke is None:
-            return
-        if stroke["kind"] == "layer":
-            layer = stroke["layer"]
-            manual = runs_from_edits(stroke["edits"])
-            if manual == list(layer.manual):
+        with self._edit():
+            stroke = self._stroke
+            self._stroke = None
+            if stroke is None:
                 return
-            layer.manual = manual
+            if stroke["kind"] == "layer":
+                layer = stroke["layer"]
+                manual = runs_from_edits(stroke["edits"])
+                if manual == list(layer.manual):
+                    return
+                layer.manual = manual
+                self._mark_modified()
+                self._recompute_layer_and_dependents(layer)
+                return
+            if not stroke["entries"]:
+                return
+            image = stroke["image"]
+            image.paint = coalesce_paint([*image.paint, *stroke["entries"]])
+            self._rebuild_working(image)
+            self.flush_recompute()
             self._mark_modified()
-            self._recompute_layer_and_dependents(layer)
-            return
-        if not stroke["entries"]:
-            return
-        image = stroke["image"]
-        image.paint = coalesce_paint([*image.paint, *stroke["entries"]])
-        self._rebuild_working(image)
-        self.flush_recompute()
-        self._mark_modified()
 
     def _stamp_dab(self, x: int, y: int) -> None:
         stroke = self._stroke
@@ -1242,47 +1510,49 @@ class MainWindow(QMainWindow):
         self.canvas.set_base_pixels(stroke["image"].id, stroke["pixels"])
 
     def _fill_layer(self, layer: Layer, x: int, y: int) -> None:
-        height, width = self._canvas_shape()
-        if height <= 0 or not (0 <= x < width and 0 <= y < height):
-            return
-        mask = self.masks.get(layer.id)
-        if mask is None or mask.shape[:2] != (height, width):
-            mask = np.zeros((height, width), dtype=np.uint8)
-        # Clicking an area that is already on would freeze that whole region
-        # into the manual override. Leave it to the color mask instead.
-        if mask[y, x] > 0:
-            return
-        region = flood_region(mask > 0, x, y)
-        edits = edits_from_runs(layer.manual, (height, width))
-        edits[region] = PAINT
-        layer.manual = runs_from_edits(edits)
-        self._mark_modified()
-        self._recompute_layer_and_dependents(layer)
+        with self._edit():
+            height, width = self._canvas_shape()
+            if height <= 0 or not (0 <= x < width and 0 <= y < height):
+                return
+            mask = self.masks.get(layer.id)
+            if mask is None or mask.shape[:2] != (height, width):
+                mask = np.zeros((height, width), dtype=np.uint8)
+            # Clicking an area that is already on would freeze that whole region
+            # into the manual override. Leave it to the color mask instead.
+            if mask[y, x] > 0:
+                return
+            region = flood_region(mask > 0, x, y)
+            edits = edits_from_runs(layer.manual, (height, width))
+            edits[region] = PAINT
+            layer.manual = runs_from_edits(edits)
+            self._mark_modified()
+            self._recompute_layer_and_dependents(layer)
 
     def _fill_image(self, image, x: int, y: int) -> None:
-        working = self._working.get(image.id)
-        if working is None or not (0 <= y < working.shape[0] and 0 <= x < working.shape[1]):
-            return
-        color = self.paint_toolbar.color
-        filled = flood_fill_rgba(working, x, y, color)
-        if np.array_equal(filled, working):
-            return
-        changed = np.any(filled != working, axis=-1)
-        origin = paint_origin(
-            self._originals[image.id],
-            image.paint,
-            image.background_removed,
-            image.background_tolerance,
-        )
-        origin_x, origin_y = origin
-        entries = list(image.paint)
-        ys, xs = np.nonzero(changed)
-        for px, py in zip(xs.tolist(), ys.tolist()):
-            entries.append((px + origin_x, py + origin_y, *color))
-        image.paint = coalesce_paint(entries)
-        self._rebuild_working(image)
-        self.flush_recompute()
-        self._mark_modified()
+        with self._edit():
+            working = self._working.get(image.id)
+            if working is None or not (0 <= y < working.shape[0] and 0 <= x < working.shape[1]):
+                return
+            color = self.paint_toolbar.color
+            filled = flood_fill_rgba(working, x, y, color)
+            if np.array_equal(filled, working):
+                return
+            changed = np.any(filled != working, axis=-1)
+            origin = paint_origin(
+                self._originals[image.id],
+                image.paint,
+                image.background_removed,
+                image.background_tolerance,
+            )
+            origin_x, origin_y = origin
+            entries = list(image.paint)
+            ys, xs = np.nonzero(changed)
+            for px, py in zip(xs.tolist(), ys.tolist()):
+                entries.append((px + origin_x, py + origin_y, *color))
+            image.paint = coalesce_paint(entries)
+            self._rebuild_working(image)
+            self.flush_recompute()
+            self._mark_modified()
 
     def _recompute_layer_and_dependents(self, layer: Layer) -> None:
         self.recompute_layer(layer)
@@ -1418,7 +1688,9 @@ class MainWindow(QMainWindow):
         self._sync_project_state()
         written = project_io.save_project(target, self.project)
         self.project_path = written
+        self._history.mark_saved()
         self._set_unmodified()
+        self._update_undo_actions()
         self.statusBar().showMessage(f"Saved {written}")
         return written
 
@@ -1439,35 +1711,45 @@ class MainWindow(QMainWindow):
             original = load_rgba(candidate)
             loaded.append((image, original, candidate))
 
-        self.project = project
-        self.project_path = path
-        self.masks.clear()
-        self.outlines.clear()
-        self._dirty_layers.clear()
-        self._originals.clear()
-        self._working.clear()
-        self._palettes.clear()
-        self._comparing.clear()
-        for image, original, candidate in loaded:
-            image.path = str(candidate)
-            self._originals[image.id] = original
-            self._working[image.id] = self._compose_working(image)
+        self._history_locked = True
+        try:
+            self._stroke = None
+            self.canvas.cancel_rectangle()
+            self._open_gesture = None
+            self.project = project
+            self.project_path = path
+            self.masks.clear()
+            self.outlines.clear()
+            self._dirty_layers.clear()
+            self._originals.clear()
+            self._working.clear()
+            self._palettes.clear()
+            self._comparing.clear()
+            for image, original, candidate in loaded:
+                image.path = str(candidate)
+                self._originals[image.id] = original
+                self._working[image.id] = self._compose_working(image)
 
-        self.checker_slider.blockSignals(True)
-        self.checker_slider.setValue(project.checker_opacity)
-        self.checker_slider.blockSignals(False)
-        self.canvas.set_checker_opacity(project.checker_opacity)
+            self.checker_slider.blockSignals(True)
+            self.checker_slider.setValue(project.checker_opacity)
+            self.checker_slider.blockSignals(False)
+            self.canvas.set_checker_opacity(project.checker_opacity)
 
-        self._refresh_canvas(fit=True)
-        first = project.layers[0].id if project.layers else None
-        if first is None:
-            self.inspector.set_layer(None)
-            self._refresh_layers()
-            self.layer_pane.select_base()
-        else:
-            self._refresh_layers(selected_id=first)
-        self.flush_recompute()
-        self._set_unmodified()
+            self._refresh_canvas(fit=True)
+            first = project.layers[0].id if project.layers else None
+            if first is None:
+                self.inspector.set_layer(None)
+                self._refresh_layers()
+                self.layer_pane.select_base()
+            else:
+                self._refresh_layers(selected_id=first)
+            self.flush_recompute()
+            self._set_unmodified()
+        finally:
+            self._history_locked = False
+        self._history.reset(self._capture())
+        self._sync_modified()
+        self._update_undo_actions()
         self.statusBar().showMessage(f"Opened {path.name}")
 
     def _locate_image(self, missing: str | None) -> Path | None:
@@ -1525,9 +1807,10 @@ class MainWindow(QMainWindow):
     # ---- board settings & export ------------------------------------------------------------
 
     def _store_board_settings(self, settings) -> None:
-        if settings != self.project.board:
-            self.project.board = settings
-            self._mark_modified()
+        with self._edit():
+            if settings != self.project.board:
+                self.project.board = settings
+                self._mark_modified()
 
     def _on_board_settings(self):
         if not self._working:

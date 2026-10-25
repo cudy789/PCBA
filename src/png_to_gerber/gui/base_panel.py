@@ -229,6 +229,7 @@ class BaseImagePanel(QWidget):
                 button.setToolTip(self._swatch_tip(color))
             return
         for button in self._swatches:
+            button.hide()
             button.setParent(None)
             button.deleteLater()
         self._swatches.clear()

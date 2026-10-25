@@ -163,6 +163,7 @@ class LayerInspector(QWidget):
     def set_dominant_colors(self, colors: list[tuple[tuple[int, int, int], int]]):
         """Populate the dominant-color swatch row."""
         for btn in self._swatch_buttons:
+            btn.hide()
             btn.setParent(None)
             btn.deleteLater()
         self._swatch_buttons.clear()

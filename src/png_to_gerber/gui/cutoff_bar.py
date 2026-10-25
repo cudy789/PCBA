@@ -16,6 +16,8 @@ class CutoffBar(QWidget):
     """
 
     cutoffs_changed = Signal(object)
+    drag_started = Signal()
+    drag_finished = Signal()
 
     MARGIN = 12
     TRACK_TOP = 6
@@ -76,6 +78,7 @@ class CutoffBar(QWidget):
             return
         self._drag = index
         self.grabMouse()
+        self.drag_started.emit()
         self._move_drag(event.position().x())
         event.accept()
 
@@ -93,6 +96,7 @@ class CutoffBar(QWidget):
         self._move_drag(event.position().x())
         self._drag = None
         self.releaseMouse()
+        self.drag_finished.emit()
         event.accept()
 
     # ---- painting ------------------------------------------------------------------
