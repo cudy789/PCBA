@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import QEvent, QPointF, Qt, Signal
+from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
@@ -105,6 +105,7 @@ class ImageCanvas(QGraphicsView):
         self._brush_cursor: QGraphicsEllipseItem | None = None
         self._brush_diameter = 1
         self._cursor_xy: tuple[int, int] | None = None
+        self._setting_pan_margin = False
 
     # ---- content management -------------------------------------------------
 
@@ -115,10 +116,11 @@ class ImageCanvas(QGraphicsView):
     def set_bases(self, images: list[tuple[int, np.ndarray]], fit: bool = True) -> None:
         """Show every base image, each aligned to the top-left of the canvas.
 
-        Later images paint above earlier ones. The scene covers the largest
-        width and height. `fit=False` keeps the current zoom when the canvas
-        size does not change. `base_item` is the first image, for callers that
-        still track a single pixmap.
+        Later images paint above earlier ones. The artwork covers the largest
+        width and height, and the view can scroll a full window past that.
+        `fit=False` keeps the current zoom when the canvas size does not
+        change. `base_item` is the first image, for callers that still track
+        a single pixmap.
         """
         self._scene.clear()
         self.overlay_items.clear()
@@ -143,9 +145,12 @@ class ImageCanvas(QGraphicsView):
                 self.base_item = item
         same_size = self._image_size == (max_w, max_h) and max_w > 0
         self._image_size = (max_w, max_h) if images else None
-        self._scene.setSceneRect(0, 0, max(max_w, 1), max(max_h, 1))
-        if images and (fit or not same_size):
-            self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
+        content = self._content_rect()
+        if not images:
+            self.resetTransform()
+        elif fit or not same_size:
+            self.fitInView(content, Qt.KeepAspectRatio)
+        self._expand_pan_margin()
         self._place_brush_cursor()
 
     def set_checker_opacity(self, percent: int) -> None:
@@ -473,6 +478,74 @@ class ImageCanvas(QGraphicsView):
             return
         super().keyReleaseEvent(event)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._expand_pan_margin()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._expand_pan_margin()
+
     def wheelEvent(self, event):
         factor = 1.25 if event.angleDelta().y() > 0 else 0.8
+        point = event.position().toPoint()
+        before = self.mapToScene(point)
+        anchor = self.transformationAnchor()
+        self.setTransformationAnchor(QGraphicsView.NoAnchor)
         self.scale(factor, factor)
+        self.setTransformationAnchor(anchor)
+        self._expand_pan_margin()
+        self._restore_view_anchor(before, point)
+
+    def _content_rect(self) -> QRectF:
+        if not self._image_size:
+            return QRectF(0, 0, 1, 1)
+        width, height = self._image_size
+        return QRectF(0, 0, max(width, 1), max(height, 1))
+
+    def _expand_pan_margin(self) -> None:
+        """Scroll one full view past the artwork on every side.
+
+        The scene used to stop at the image, so a fitted or zoomed canvas
+        could not move and its edges stayed glued to the window.
+        """
+        if self._setting_pan_margin:
+            return
+        self._setting_pan_margin = True
+        try:
+            content = self._content_rect()
+            view = self.viewport().rect()
+            if view.width() < 2 or view.height() < 2:
+                padded = content
+            else:
+                top_left = self.mapToScene(view.topLeft())
+                bottom_right = self.mapToScene(view.bottomRight())
+                span_x = abs(bottom_right.x() - top_left.x())
+                span_y = abs(bottom_right.y() - top_left.y())
+                padded = content.adjusted(-span_x, -span_y, span_x, span_y)
+            current = self._scene.sceneRect()
+            if (
+                abs(current.x() - padded.x()) <= 0.5
+                and abs(current.y() - padded.y()) <= 0.5
+                and abs(current.width() - padded.width()) <= 0.5
+                and abs(current.height() - padded.height()) <= 0.5
+            ):
+                return
+            anchor = self.mapToScene(view.topLeft())
+            self._scene.setSceneRect(padded)
+            if view.width() >= 2 and view.height() >= 2:
+                self._restore_view_anchor(anchor, view.topLeft())
+        finally:
+            self._setting_pan_margin = False
+
+    def _restore_view_anchor(self, scene_point: QPointF, view_point) -> None:
+        """Put `scene_point` back at `view_point` after the scroll range changes."""
+        placed = self.mapFromScene(scene_point)
+        dx = int(round(placed.x() - view_point.x()))
+        dy = int(round(placed.y() - view_point.y()))
+        if dx:
+            bar = self.horizontalScrollBar()
+            bar.setValue(bar.value() + dx)
+        if dy:
+            bar = self.verticalScrollBar()
+            bar.setValue(bar.value() + dy)

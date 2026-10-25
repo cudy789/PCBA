@@ -2,7 +2,7 @@
 
 import zipfile
 
-from PySide6.QtGui import QPalette
+from PySide6.QtGui import QKeySequence, QPalette
 from PySide6.QtWidgets import QApplication, QToolBar
 
 from png_to_gerber.gui.export_dialog import ExportDialog
@@ -21,6 +21,9 @@ def test_there_is_no_image_menu_and_file_owns_export(qtbot, fixture_image_path):
 
     file_menu = win.menuBar().actions()[0].menu()
     file_texts = [action.text().replace("&", "") for action in file_menu.actions()]
+    assert "New project" in file_texts
+    assert file_texts.index("New project") < file_texts.index("Open project...")
+    assert win.new_project_action.shortcut() == QKeySequence("Ctrl+N")
     assert "Open project..." in file_texts
     assert "Save project" in file_texts
     assert "Open image..." in file_texts

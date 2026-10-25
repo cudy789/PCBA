@@ -1,7 +1,8 @@
 """Offscreen GUI interaction tests (pytest-qt)."""
 
 import pytest
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+from PySide6.QtGui import QMouseEvent, QWheelEvent
 
 from png_to_gerber.gui.main_window import MainWindow
 from png_to_gerber.model import LayerType, Side
@@ -244,6 +245,66 @@ def test_export_dialog_validation(qtbot, tmp_path):
     assert "not allowed" in dialog.validate()
     dialog.name_edit.setText("art")
     assert dialog.validate() is None
+
+
+def test_the_canvas_scrolls_past_the_image(window, qtbot):
+    window.show()
+    qtbot.waitExposed(window)
+    view = window.canvas
+    width, height = view._image_size
+    rect = view.sceneRect()
+    assert rect.left() < -10
+    assert rect.top() < -10
+    assert rect.right() > width + 10
+    assert rect.bottom() > height + 10
+
+    view.horizontalScrollBar().setValue(view.horizontalScrollBar().minimum())
+    view.verticalScrollBar().setValue(view.verticalScrollBar().minimum())
+    origin = view.mapFromScene(QPointF(0, 0))
+    assert origin.x() > 10
+    assert origin.y() > 10
+
+    cursor = view.mapFromScene(QPointF(20, 30))
+    before = view.mapToScene(cursor)
+    step = QPoint(0, 120)
+    view.wheelEvent(
+        QWheelEvent(
+            QPointF(cursor),
+            QPointF(view.mapToGlobal(cursor)),
+            step,
+            step,
+            Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier,
+            Qt.ScrollPhase.NoScrollPhase,
+            False,
+        )
+    )
+    after = view.mapToScene(cursor)
+    assert after.x() == pytest.approx(before.x(), abs=1.5)
+    assert after.y() == pytest.approx(before.y(), abs=1.5)
+    view.horizontalScrollBar().setValue(view.horizontalScrollBar().minimum())
+    assert view.mapFromScene(QPointF(0, 0)).x() > 10
+
+
+def test_middle_drag_pans_a_fitted_canvas(window, qtbot):
+    window.show()
+    qtbot.waitExposed(window)
+    view = window.canvas
+    center = view.viewport().rect().center()
+    before = view.mapToScene(center)
+    start = QPointF(center)
+    end = QPointF(center.x() + 90, center.y() + 50)
+
+    def mouse(kind, pos, button=Qt.MouseButton.MiddleButton):
+        buttons = Qt.MouseButton.NoButton if kind == QEvent.Type.MouseButtonRelease else button
+        return QMouseEvent(kind, pos, pos, button, buttons, Qt.KeyboardModifier.NoModifier)
+
+    view.mousePressEvent(mouse(QEvent.Type.MouseButtonPress, start))
+    view.mouseMoveEvent(mouse(QEvent.Type.MouseMove, end))
+    view.mouseReleaseEvent(mouse(QEvent.Type.MouseButtonRelease, end))
+    after = view.mapToScene(center)
+    assert before.x() - after.x() > 20
+    assert before.y() - after.y() > 10
 
 
 def test_export_dialog_aspect_lock(qtbot):

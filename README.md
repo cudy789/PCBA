@@ -126,8 +126,8 @@ image. Untick *Flatten colors* to restore the source colors. Each image
 remembers its own settings.
 
 The top toolbar holds the **Checker opacity** slider (how strong the transparency
-grid is; it starts at 50%). Open, save, and export live in the File menu, along
-with **Undo** (Ctrl+Z) and **Redo** (Ctrl+Shift+Z). Those step through project
+grid is; it starts at 50%). New (Ctrl+N), open, save, and export live in the
+File menu, along with **Undo** (Ctrl+Z) and **Redo** (Ctrl+Shift+Z). Those step through project
 changes: layers, paint, images, flatten, background removal, board settings,
 visibility, and checker opacity. One paint stroke, line, rectangle, fill, or
 slider drag is a single step. Zoom, pan, the paint tool, and brush size stay
@@ -143,6 +143,7 @@ mask, or select the base image to edit its pixels. The tools are a
 drawn, and Ctrl locks it to a square), an **eraser**, and a **fill**
 bucket. One **Brush Size** slider, or a typed number, sets the diameter for every tool except fill. Click the active tool
 again to pan with the left button; middle-drag pans while a tool is active.
+The view scrolls past the image, so an edge can sit in the middle of the window.
 
 On a layer, paint forces those pixels on and erase forces them off. The
 strokes stay when you change tolerance, gap closing, or invert, and they are

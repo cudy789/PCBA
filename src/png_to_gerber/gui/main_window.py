@@ -201,6 +201,9 @@ class MainWindow(QMainWindow):
         self.redo_action = QAction("&Redo", self)
         self.redo_action.setShortcut("Ctrl+Shift+Z")
         self.redo_action.triggered.connect(self.redo)
+        self.new_project_action = QAction("&New project", self)
+        self.new_project_action.setShortcut("Ctrl+N")
+        self.new_project_action.triggered.connect(self._on_new_project)
         self.open_project_action = QAction("Open &project...", self)
         self.open_project_action.setShortcut("Ctrl+Shift+O")
         self.open_project_action.triggered.connect(self._on_open_project)
@@ -252,6 +255,7 @@ class MainWindow(QMainWindow):
             self.undo_action,
             self.redo_action,
             None,
+            self.new_project_action,
             self.open_project_action,
             self.save_action,
             self.save_as_action,
@@ -1693,6 +1697,47 @@ class MainWindow(QMainWindow):
         self._update_undo_actions()
         self.statusBar().showMessage(f"Saved {written}")
         return written
+
+    def new_project(self) -> None:
+        """Replace the open project with a blank one."""
+        self._history_locked = True
+        try:
+            self._recompute_timer.stop()
+            self._stroke = None
+            self.canvas.cancel_rectangle()
+            self._open_gesture = None
+            self.project = Project()
+            self.project_path = None
+            self.masks.clear()
+            self.outlines.clear()
+            self._dirty_layers.clear()
+            self._originals.clear()
+            self._working.clear()
+            self._palettes.clear()
+            self._comparing.clear()
+            self.checker_slider.blockSignals(True)
+            self.checker_slider.setValue(self.project.checker_opacity)
+            self.checker_slider.blockSignals(False)
+            self.canvas.set_checker_opacity(self.project.checker_opacity)
+            self._set_checked(self.base_visible_action, True)
+            self._set_checked(self.remove_bg_action, False)
+            self.inspector.eyedropper_button.setChecked(False)
+            self.inspector.set_layer(None)
+            self._refresh_canvas(fit=True)
+            self._refresh_layers()
+            self.layer_pane.select_base()
+            self._set_unmodified()
+        finally:
+            self._history_locked = False
+        self._history.reset(self._capture())
+        self._sync_modified()
+        self._update_undo_actions()
+        self.statusBar().showMessage("Open an image or a project to begin.")
+
+    def _on_new_project(self) -> None:
+        if not self._confirm_discard_changes("starting a new project"):
+            return
+        self.new_project()
 
     def open_project(self, path: str | Path, image_path: str | Path | None = None) -> None:
         """Load a .prj file, restoring layers, board settings, and view state."""

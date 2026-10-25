@@ -190,6 +190,88 @@ def pick_file(monkeypatch, path):
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (str(path), ""))
 
 
+def test_new_project_clears_images_layers_and_history(window, tmp_path):
+    window.add_layer(LayerType.COPPER)
+    window.save_project(tmp_path / "kept.prj")
+    window.add_layer(LayerType.SILKSCREEN)
+    window.checker_slider.setValue(80)
+    window._store_board_settings(BoardSettings(12.0, 9.0, True, "", "board"))
+    assert window.undo_action.isEnabled()
+
+    window.new_project()
+
+    assert window.project.images == []
+    assert window.project.layers == []
+    assert window.project_path is None
+    assert window.project.board == BoardSettings()
+    assert not window.is_modified
+    assert window.windowTitle().startswith("untitled")
+    assert not window.undo_action.isEnabled()
+    assert not window.redo_action.isEnabled()
+    assert window.checker_slider.value() == 50
+    assert window.canvas.base_item is None
+    assert window.layer_pane.list.count() == 1
+
+
+def test_new_project_without_changes_does_not_prompt(window, prompt):
+    window._on_new_project()
+    assert prompt.calls == []
+    assert window.project.images == []
+
+
+def test_new_project_prompts_when_modified(window, prompt):
+    window.add_layer(LayerType.COPPER)
+    window._on_new_project()
+    assert len(prompt.calls) == 1
+    title, text = prompt.calls[0]
+    assert title == "Unsaved changes" and "starting a new project" in text
+    assert window.project.images == []
+
+
+def test_cancel_keeps_the_project_when_starting_new(window, prompt):
+    window.add_layer(LayerType.COPPER)
+    prompt.answer = Cancel
+    window._on_new_project()
+    assert window.is_modified
+    assert len(window.project.layers) == 1
+    assert window.project_path is None
+
+
+def test_discard_starts_a_new_project_without_saving(window, tmp_path, prompt):
+    _, mine = saved_project(window, tmp_path)
+    window.add_layer(LayerType.SILKSCREEN)
+    prompt.answer = Discard
+    window._on_new_project()
+    import json
+
+    assert len(json.loads(mine.read_text())["layers"]) == 1
+    assert window.project.images == []
+    assert window.project_path is None
+    assert not window.is_modified
+
+
+def test_save_writes_the_project_before_starting_new(window, tmp_path, prompt, monkeypatch):
+    window.add_layer(LayerType.COPPER)
+    prompt.answer = Save
+    target = tmp_path / "before_new.prj"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(target), ""))
+    window._on_new_project()
+    assert target.exists()
+    assert window.project.images == []
+    assert window.project_path is None
+    assert not window.is_modified
+
+
+def test_cancelling_save_does_not_start_a_new_project(window, prompt, monkeypatch):
+    window.add_layer(LayerType.COPPER)
+    prompt.answer = Save
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: ("", ""))
+    window._on_new_project()
+    assert window.project_path is None
+    assert window.is_modified
+    assert len(window.project.layers) == 1
+
+
 def test_open_project_without_changes_does_not_prompt(window, tmp_path, other_project, prompt, monkeypatch):
     saved_project(window, tmp_path)
     pick_file(monkeypatch, other_project)
